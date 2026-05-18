@@ -10,8 +10,30 @@ from pydantic import BaseModel, ConfigDict, Field
 PRICE_FORMATION_UNIT = {
     1: "impressions",
     2: "clicks",
-    3: "rubles",
+    3: "money",
 }
+
+
+CURRENCY_BY_CODE: dict[int, tuple[str, str]] = {
+    643: ("RUB", "₽"),
+    810: ("RUB", "₽"),
+    840: ("USD", "$"),
+    978: ("EUR", "€"),
+    980: ("UAH", "₴"),
+    933: ("BYN", "Br"),
+    398: ("KZT", "₸"),
+    156: ("CNY", "¥"),
+    348: ("HUF", "Ft"),
+    826: ("GBP", "£"),
+}
+
+
+def currency_code(code: int) -> str:
+    return CURRENCY_BY_CODE.get(code, (f"#{code}", ""))[0]
+
+
+def currency_symbol(code: int) -> str:
+    return CURRENCY_BY_CODE.get(code, (f"#{code}", ""))[1]
 
 
 class HybridPriceLimit(BaseModel):
@@ -52,14 +74,27 @@ class HybridCampaign(BaseModel):
     totalSum: float = 0.0
 
     def fact_for_unit(self, unit: str) -> tuple[float, float]:
-        """Возвращает (today_fact, period_fact) для указанной единицы лимита."""
+        """Возвращает (today_fact, period_fact) для указанной единицы лимита.
+        period_fact — факт за запрошенное окно (MTD)."""
         if unit == "impressions":
             return self.todayImpressions, self.totalPeriodImpressions
-        if unit == "rubles":
+        if unit in ("money", "rubles"):
             return self.todaySum, self.totalPeriodSum
         if unit == "clicks":
             return self.todayClick, self.totalPeriodClick
         return 0.0, 0.0
+
+    def lifetime_fact(self, unit: str) -> float:
+        """Совокупный факт с начала кампании до сегодня (в указанной единице).
+        Используется для расчёта pace_overall на кампаниях с end_date."""
+        if unit == "impressions":
+            return float(self.impressionCount or 0)
+        if unit in ("money", "rubles"):
+            return self.totalSum
+        if unit == "clicks":
+            # на campaign-level lifetime клики не выставлены — fallback на period
+            return self.totalPeriodClick
+        return 0.0
 
 
 class HybridGetTotalResponse(BaseModel):
@@ -80,6 +115,10 @@ class CampaignPaceOut(BaseModel):
     """То что отдаём наружу — для UI/JSON ответа."""
     agency: str
     advertiser_id: str
+    advertiser_name: str = ""
+    currency: int = 643
+    currency_code: str = "RUB"
+    currency_symbol: str = "₽"
     campaign_id: str
     campaign_name: str
     status: int
@@ -92,7 +131,7 @@ class CampaignPaceOut(BaseModel):
     days_left: Optional[int]
 
     limit_kind: str  # "daily" | "period_budget" | "total" | "none"
-    limit_unit: str  # "impressions" | "rubles" | "clicks" | "none"
+    limit_unit: str  # "impressions" | "money" | "clicks" | "none"
     daily_target: Optional[float]  # сколько в день должны крутить (в limit_unit)
     period_budget: Optional[float]
     today_fact: float  # факт сегодня в limit_unit

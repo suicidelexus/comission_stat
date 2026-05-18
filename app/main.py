@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from pathlib import Path
@@ -30,6 +31,21 @@ _sync_lock = asyncio.Lock()
 # Простой in-memory кэш последнего успешного sync'а
 _cache: dict[str, list[CampaignPaceOut]] = {"items": []}
 _cache_ts: dict[str, Optional[str]] = {"at": None}
+
+# Прогресс текущего/последнего синка — отдаётся в /sync/status для прогресс-бара.
+_sync_progress: dict = {
+    "status": "idle",          # idle | running | done | error
+    "current": 0,
+    "total": 0,
+    "current_agency": "",
+    "agencies_done": 0,
+    "campaigns_collected": 0,
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": 0,
+    "error": None,
+}
+_sync_task: Optional[asyncio.Task] = None
 
 
 _CACHE_FILE = Path(__file__).resolve().parent.parent / "cache.json"
@@ -109,12 +125,18 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
     client = app.state.hybrid
     end = date.today()
     start = end.replace(day=1)
+    tomorrow = end.toordinal() + 1
 
     agencies = await _resolve_agencies()
     out: list[CampaignPaceOut] = []
+    dropped = {"not_started": 0, "finished": 0, "no_limit": 0, "paused": 0, "no_fact_today": 0, "ends_today": 0}
+
+    _sync_progress.update(total=len(agencies), current=0, current_agency="", agencies_done=0, campaigns_collected=0)
 
     for ai, agency in enumerate(agencies, 1):
-        log.info("[%d/%d] agency %s (%s) — switching", ai, len(agencies), agency.name or agency.id, agency.id)
+        agency_label = agency.name or agency.id
+        _sync_progress.update(current=ai, current_agency=agency_label)
+        log.info("[%d/%d] agency %s (%s) — switching", ai, len(agencies), agency_label, agency.id)
         try:
             await client.switch_to_agency(agency.id)
             advertisers = await client.list_advertisers()
@@ -122,6 +144,7 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
             raise HTTPException(status_code=401, detail=str(e))
         except Exception as e:
             log.warning("agency %s skipped: %s", agency.id, e)
+            _sync_progress["agencies_done"] = ai
             continue
 
         # Префильтр только по имени — мусорные advertiser'ы (for deleting/archive/test).
@@ -131,10 +154,7 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
         before = len(advertisers)
         if skip_re:
             advertisers = [a for a in advertisers if not skip_re.search(a.name or "")]
-        log.info(
-            "  advertisers: %d → %d (after name filter)",
-            before, len(advertisers),
-        )
+        log.info("  advertisers: %d → %d (after name filter)", before, len(advertisers))
 
         # GetTotal'ы можно тащить параллельно — context agency уже зафиксирован,
         # стейт сессии больше не меняется. Семафор бережёт API от перегруза.
@@ -151,6 +171,8 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
                 compute_pace(
                     agency=agency.name or agency.id,
                     advertiser_id=adv.id,
+                    advertiser_name=adv.name or "",
+                    currency=adv.currency,
                     c=c,
                     period_start=start,
                     period_end=end,
@@ -160,9 +182,36 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
 
         results = await asyncio.gather(*(fetch_one(a) for a in advertisers))
         for r in results:
-            out.extend(r)
-    from datetime import datetime
-    log.info("done: %d campaigns total", len(out))
+            for p in r:
+                if p.status != 1:
+                    dropped["paused"] += 1
+                    continue
+                if p.signal == SignalLevel.NOT_STARTED:
+                    dropped["not_started"] += 1
+                    continue
+                if p.signal == SignalLevel.FINISHED:
+                    dropped["finished"] += 1
+                    continue
+                if p.signal == SignalLevel.NO_LIMIT:
+                    dropped["no_limit"] += 1
+                    log.info("    no_limit: %s/%s (%s)", agency_label, p.campaign_name, p.campaign_id)
+                    continue
+                if p.today_fact <= 0:
+                    dropped["no_fact_today"] += 1
+                    continue
+                # завтра ещё крутит?
+                if not p.is_dont_expire:
+                    if p.end_date is None or p.end_date.toordinal() < tomorrow:
+                        dropped["ends_today"] += 1
+                        continue
+                out.append(p)
+        _sync_progress.update(agencies_done=ai, campaigns_collected=len(out))
+
+    log.info(
+        "done: %d active campaigns kept; dropped: %s",
+        len(out),
+        ", ".join(f"{k}={v}" for k, v in dropped.items()),
+    )
     _cache["items"] = out
     _cache_ts["at"] = datetime.utcnow().isoformat()
     _save_cache_to_disk()
@@ -227,6 +276,52 @@ async def list_green():
     return [x for x in items if x.signal == SignalLevel.GREEN]
 
 
+async def _run_sync_background() -> None:
+    """Обёртка для фонового запуска синка — обновляет _sync_progress."""
+    started = time.monotonic()
+    _sync_progress.update(
+        status="running",
+        started_at=datetime.utcnow().isoformat(),
+        finished_at=None,
+        error=None,
+        current=0,
+        total=0,
+        agencies_done=0,
+        campaigns_collected=0,
+        current_agency="",
+        elapsed_seconds=0,
+    )
+    try:
+        await _fetch_all_campaigns()
+        _sync_progress["status"] = "done"
+    except Exception as e:
+        log.exception("background sync failed")
+        _sync_progress["status"] = "error"
+        _sync_progress["error"] = str(e)
+    finally:
+        _sync_progress["finished_at"] = datetime.utcnow().isoformat()
+        _sync_progress["elapsed_seconds"] = round(time.monotonic() - started, 1)
+
+
+@app.post("/sync/start")
+async def sync_start() -> dict:
+    """Запускает синк в фоне. Если уже идёт — возвращает текущий статус."""
+    global _sync_task
+    if _sync_task and not _sync_task.done():
+        return {"started": False, "reason": "already_running", "progress": _sync_progress}
+    _sync_task = asyncio.create_task(_run_sync_background())
+    return {"started": True, "progress": _sync_progress}
+
+
+@app.get("/sync/status")
+async def sync_status() -> dict:
+    out = dict(_sync_progress)
+    if out["status"] == "running" and out.get("started_at"):
+        started_dt = datetime.fromisoformat(out["started_at"])
+        out["elapsed_seconds"] = round((datetime.utcnow() - started_dt).total_seconds(), 1)
+    return out
+
+
 @app.get("/summary")
 async def summary() -> dict:
     items = await _fetch_all_campaigns()
@@ -242,10 +337,18 @@ async def summary() -> dict:
     }
 
 
+_VISIBLE_SIGNALS = {SignalLevel.GREEN, SignalLevel.YELLOW, SignalLevel.RED}
+
+
+def _visible_items() -> list[CampaignPaceOut]:
+    return [x for x in _cache["items"] if x.signal in _VISIBLE_SIGNALS and x.status == 1]
+
+
 @app.get("/cache/summary")
 async def cache_summary() -> dict:
-    """Сводка по кэшу — не дёргает Hybrid."""
-    items = _cache["items"]
+    """Сводка по кэшу — не дёргает Hybrid. Учитывает только активные кампании
+    с сигналом green/yellow/red (после фильтрации finished/not_started/no_limit)."""
+    items = _visible_items()
     by_signal: dict[str, int] = {}
     for x in items:
         by_signal[x.signal.value] = by_signal.get(x.signal.value, 0) + 1
@@ -259,20 +362,18 @@ async def cache_summary() -> dict:
 @app.get("/cache/green", response_model=list[CampaignPaceOut])
 async def cache_green():
     """Зелёные из кэша — мгновенно."""
-    return [x for x in _cache["items"] if x.signal == SignalLevel.GREEN]
+    return [x for x in _visible_items() if x.signal == SignalLevel.GREEN]
 
 
 @app.get("/cache/all", response_model=list[CampaignPaceOut])
 async def cache_all(
     signal: Optional[SignalLevel] = Query(None),
-    only_active: bool = Query(False),
 ):
-    """Всё из кэша — мгновенно. Используется HTML-страничкой."""
-    items = list(_cache["items"])
+    """Всё из кэша — мгновенно. Используется HTML-страничкой.
+    Возвращаются только активные кампании с сигналом green/yellow/red."""
+    items = _visible_items()
     if signal:
         items = [x for x in items if x.signal == signal]
-    if only_active:
-        items = [x for x in items if x.status == 1]
     return items
 
 
