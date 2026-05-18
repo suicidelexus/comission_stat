@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>DSP Pacing</title>
+<style>
+  :root {
+    --bg: #0f1419; --fg: #e6e6e6; --muted: #888; --border: #2a2f3a;
+    --row-hover: #1a1f2a;
+    --green: #4ade80; --yellow: #facc15; --red: #f87171; --blue: #60a5fa; --gray: #6b7280;
+  }
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; margin: 0; padding: 16px; font-size: 13px; }
+  h1 { font-size: 18px; margin: 0 0 12px 0; }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .summary { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .pill { padding: 4px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; background: #1a1f2a; }
+  .pill.green { background: rgba(74,222,128,0.15); color: var(--green); }
+  .pill.yellow { background: rgba(250,204,21,0.15); color: var(--yellow); }
+  .pill.red { background: rgba(248,113,113,0.15); color: var(--red); }
+  .pill.gray { background: rgba(107,114,128,0.15); color: var(--gray); }
+  .filters { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+  .filters input, .filters select, .filters button {
+    background: #1a1f2a; color: var(--fg); border: 1px solid var(--border);
+    padding: 6px 10px; border-radius: 6px; font-size: 13px;
+  }
+  .filters input[type=text] { min-width: 260px; }
+  .filters button { cursor: pointer; }
+  .filters button:hover { background: #232936; }
+  .filters label { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }
+  thead th:hover { color: var(--fg); }
+  tbody tr { border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody td { padding: 8px 10px; vertical-align: top; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .signal-cell { font-weight: 700; }
+  .signal-green { color: var(--green); }
+  .signal-yellow { color: var(--yellow); }
+  .signal-red { color: var(--red); }
+  .signal-finished { color: var(--gray); }
+  .signal-no_limit, .signal-not_started { color: var(--blue); }
+  tr.row-green { background: rgba(74,222,128,0.06); }
+  tr.row-yellow { background: rgba(250,204,21,0.05); }
+  tr.row-red { background: rgba(248,113,113,0.03); }
+  .name { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agency { color: var(--muted); font-size: 11px; }
+  .reason { color: var(--muted); font-size: 11px; max-width: 320px; }
+  .loading { padding: 40px; text-align: center; color: var(--muted); }
+  .count { color: var(--muted); margin-left: auto; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>DSP Pacing</h1>
+<div class="meta" id="meta">Загружаем кэш…</div>
+
+<div class="summary" id="summary"></div>
+
+<div class="filters">
+  <select id="signal">
+    <option value="">все сигналы</option>
+    <option value="green">🟢 green</option>
+    <option value="yellow">🟡 yellow</option>
+    <option value="red">🔴 red</option>
+    <option value="finished">⚫️ finished</option>
+    <option value="no_limit">⚪️ no_limit</option>
+  </select>
+  <label><input type="checkbox" id="only_active" checked /> только active (status=1)</label>
+  <input type="text" id="search" placeholder="поиск по названию кампании / агентству…" />
+  <button id="refresh-cache">↻ перечитать кэш</button>
+  <button id="hard-sync" title="ВНИМАНИЕ: 11 минут!">🔄 full sync (11 мин)</button>
+  <a href="/docs" target="_blank">/docs</a>
+  <span class="count" id="count">—</span>
+</div>
+
+<table>
+<thead>
+<tr>
+  <th data-key="signal">сигнал</th>
+  <th data-key="agency">agency / advertiser</th>
+  <th data-key="campaign_name">кампания</th>
+  <th data-key="limit_kind">лимит</th>
+  <th data-key="daily_target" class="num">таргет/день</th>
+  <th data-key="today_fact" class="num">сегодня</th>
+  <th data-key="period_fact" class="num">за период</th>
+  <th data-key="pace_today" class="num">pace today</th>
+  <th data-key="pace_overall" class="num">pace overall</th>
+  <th data-key="days_left" class="num">days left</th>
+  <th>причина</th>
+</tr>
+</thead>
+<tbody id="rows"><tr><td colspan="11" class="loading">загрузка…</td></tr></tbody>
+</table>
+
+<script>
+let allData = [];
+let sortKey = null;
+let sortDir = 1;
+
+const SIGNAL_ORDER = { green: 0, yellow: 1, red: 2, no_limit: 3, not_started: 4, finished: 5 };
+
+function fmt(n, opts={}) {
+  if (n === null || n === undefined) return '—';
+  const { pct = false, int = false } = opts;
+  if (pct) return (n * 100).toFixed(0) + '%';
+  if (int) return Math.round(n).toLocaleString('ru-RU');
+  return n.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+}
+
+function fmtDate(s) { return s ? s.slice(0, 10) : '—'; }
+
+function getCmp(key) {
+  if (key === 'signal') {
+    return (a, b) => (SIGNAL_ORDER[a.signal] ?? 9) - (SIGNAL_ORDER[b.signal] ?? 9);
+  }
+  return (a, b) => {
+    const va = a[key], vb = b[key];
+    if (va === vb) return 0;
+    if (va === null || va === undefined) return 1;
+    if (vb === null || vb === undefined) return -1;
+    if (typeof va === 'number') return va - vb;
+    return String(va).localeCompare(String(vb), 'ru');
+  };
+}
+
+function render() {
+  const sig = document.getElementById('signal').value;
+  const onlyActive = document.getElementById('only_active').checked;
+  const search = document.getElementById('search').value.toLowerCase().trim();
+
+  let items = allData.filter(x => {
+    if (sig && x.signal !== sig) return false;
+    if (onlyActive && x.status !== 1) return false;
+    if (search) {
+      const hay = (x.campaign_name + ' ' + x.agency).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  // сортировка
+  if (sortKey) {
+    const cmp = getCmp(sortKey);
+    items.sort((a, b) => cmp(a, b) * sortDir);
+  } else {
+    items.sort((a, b) => getCmp('signal')(a, b) || (-(a.pace_overall || 0)) - (-(b.pace_overall || 0)));
+  }
+
+  document.getElementById('count').textContent = `${items.length} строк`;
+
+  const rows = items.map(x => `
+    <tr class="row-${x.signal}">
+      <td class="signal-cell signal-${x.signal}">${x.signal}</td>
+      <td>
+        <div>${escapeHtml(x.agency)}</div>
+        <div class="agency">${escapeHtml(x.advertiser_id)}</div>
+      </td>
+      <td class="name" title="${escapeHtml(x.campaign_name)}">${escapeHtml(x.campaign_name)}</td>
+      <td>${x.limit_kind}<br><span class="agency">${x.limit_unit}</span></td>
+      <td class="num">${fmt(x.daily_target, {int:true})}</td>
+      <td class="num">${fmt(x.today_fact, {int:true})}</td>
+      <td class="num">${fmt(x.period_fact, {int:true})}</td>
+      <td class="num">${x.pace_today !== null ? fmt(x.pace_today, {pct:true}) : '—'}</td>
+      <td class="num"><b>${x.pace_overall !== null ? fmt(x.pace_overall, {pct:true}) : '—'}</b></td>
+      <td class="num">${x.days_left ?? (x.is_dont_expire ? '∞' : '—')}</td>
+      <td class="reason">${escapeHtml(x.signal_reason || '')}</td>
+    </tr>`).join('');
+
+  document.getElementById('rows').innerHTML = rows || `<tr><td colspan="11" class="loading">пусто</td></tr>`;
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadCache() {
+  document.getElementById('rows').innerHTML = '<tr><td colspan="11" class="loading">загружаем кэш…</td></tr>';
+  const [sum, items] = await Promise.all([
+    fetch('/cache/summary').then(r => r.json()),
+    fetch('/cache/all').then(r => r.json()),
+  ]);
+  allData = items;
+
+  const byS = sum.by_signal || {};
+  const ts = sum.cached_at_utc;
+  document.getElementById('meta').textContent = ts
+    ? `кэш обновлён: ${new Date(ts + 'Z').toLocaleString('ru-RU')} — ${sum.total} кампаний всего`
+    : 'кэш пустой — запусти /summary через Swagger или нажми "full sync"';
+  document.getElementById('summary').innerHTML = [
+    ['green', '🟢'], ['yellow', '🟡'], ['red', '🔴'],
+    ['no_limit', '⚪️'], ['not_started', '⏳'], ['finished', '⚫️']
+  ].map(([k, em]) => byS[k] ? `<span class="pill ${k === 'green' || k === 'yellow' || k === 'red' ? k : 'gray'}">${em} ${k}: ${byS[k]}</span>` : '').join('');
+
+  render();
+}
+
+document.getElementById('signal').addEventListener('change', render);
+document.getElementById('only_active').addEventListener('change', render);
+document.getElementById('search').addEventListener('input', render);
+document.getElementById('refresh-cache').addEventListener('click', loadCache);
+document.getElementById('hard-sync').addEventListener('click', async () => {
+  if (!confirm('Полный sync ~11 минут — точно?')) return;
+  document.getElementById('rows').innerHTML = '<tr><td colspan="11" class="loading">идёт sync ~11 минут… смотри логи uvicorn</td></tr>';
+  await fetch('/summary');
+  await loadCache();
+});
+
+// сортировка по клику на заголовок
+document.querySelectorAll('thead th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.key;
+    if (sortKey === k) sortDir = -sortDir;
+    else { sortKey = k; sortDir = 1; }
+    document.querySelectorAll('thead th').forEach(h => h.textContent = h.textContent.replace(/ [↑↓]$/, ''));
+    th.textContent += sortDir === 1 ? ' ↑' : ' ↓';
+    render();
+  });
+});
+
+loadCache();
+</script>
+</body>
+</html>

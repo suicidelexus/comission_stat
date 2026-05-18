@@ -1,0 +1,15 @@
+.env
+.env.local
+tmp_*.json
+cache.json
+*.pyc
+__pycache__/
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.db
+*.sqlite
+*.sqlite3
