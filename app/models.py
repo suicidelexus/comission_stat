@@ -74,25 +74,32 @@ class HybridCampaign(BaseModel):
     totalSum: float = 0.0
 
     def fact_for_unit(self, unit: str) -> tuple[float, float]:
-        """Возвращает (today_fact, period_fact) для указанной единицы лимита.
-        period_fact — факт за запрошенное окно (MTD)."""
+        """Возвращает (today_fact, window_fact) для указанной единицы лимита.
+        - today_fact = self.today* (это РАСХОД ЗА СЕГОДНЯ по серверу Hybrid'а,
+          константа от окна запроса — НЕ совпадает с "за переданный день").
+        - window_fact = self.totalSum / self.impressionCount — это **факт за
+          переданное startDate..endDate** окно (это меняется в зависимости от
+          запроса; именно его мы используем как "вчера" при окне = [вчера, вчера]).
+
+        ВНИМАНИЕ: поля totalPeriod* от Hybrid'а — это LIFETIME (см. lifetime_fact),
+        не путать с window!
+        """
         if unit == "impressions":
-            return self.todayImpressions, self.totalPeriodImpressions
+            return self.todayImpressions, float(self.impressionCount or 0)
         if unit in ("money", "rubles"):
-            return self.todaySum, self.totalPeriodSum
+            return self.todaySum, self.totalSum
         if unit == "clicks":
-            return self.todayClick, self.totalPeriodClick
+            return self.todayClick, self.totalPeriodClick  # clicks lifetime/window не разделено в API
         return 0.0, 0.0
 
     def lifetime_fact(self, unit: str) -> float:
-        """Совокупный факт с начала кампании до сегодня (в указанной единице).
-        Используется для расчёта pace_overall на кампаниях с end_date."""
+        """Совокупный факт с начала кампании (lifetime) — это totalPeriod*.
+        Используется для расчёта pace_overall у кампаний с end_date."""
         if unit == "impressions":
-            return float(self.impressionCount or 0)
+            return float(self.totalPeriodImpressions or 0)
         if unit in ("money", "rubles"):
-            return self.totalSum
+            return self.totalPeriodSum
         if unit == "clicks":
-            # на campaign-level lifetime клики не выставлены — fallback на period
             return self.totalPeriodClick
         return 0.0
 
@@ -134,16 +141,18 @@ class CampaignPaceOut(BaseModel):
     limit_unit: str  # "impressions" | "money" | "clicks" | "none"
     daily_target: Optional[float]  # сколько в день должны крутить (в limit_unit)
     period_budget: Optional[float]
-    today_fact: float  # факт сегодня в limit_unit
-    period_fact: float  # факт за окно в limit_unit
+    # Факт за вчера (полный закрытый день — основная метрика для решения о техкосте).
+    # period_fact оставлен как алиас, чтобы старый кэш (cache.json) грузился без падений.
+    yesterday_fact: float = 0.0
+    period_fact: float = 0.0
 
-    today_spent: float
-    period_spent: float
-    total_spent: float
-    impressions_total: float
+    today_spent: float = 0.0
+    period_spent: float = 0.0
+    total_spent: float = 0.0
+    impressions_total: float = 0.0
 
-    pace_today: Optional[float]   # факт_сегодня / дневной_таргет
-    pace_overall: Optional[float] # факт_за_период / (дневной_таргет * дни_прошли)
+    pace_yesterday: Optional[float] = None  # факт_вчера / дневной_таргет
+    pace_overall: Optional[float] = None    # lifetime_факт / (дневной_таргет * days_passed)
 
     signal: SignalLevel
     signal_reason: str

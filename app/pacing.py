@@ -47,7 +47,10 @@ def compute_pace(
     period_start: date,
     period_end: date,
 ) -> CampaignPaceOut:
-    today = period_end
+    """period_start..period_end — окно которое мы запросили у Hybrid'а.
+    В новой логике это РОВНО вчера (1 день), поэтому period_fact == yesterday_fact.
+    """
+    today = date.today()
     # если startDate отсутствует — берём начало окна (битый кейс)
     start = _to_date(c.startDate) if c.startDate else period_start
     end = _to_date(c.endDate) if c.endDate else None
@@ -57,13 +60,14 @@ def compute_pace(
     days_total = (end - start).days + 1 if end else None
     days_left = (end - today).days if end else None
     days_passed_from_start = max(1, (today - start).days + 1)
-    # MTD-окно: для текущего отображения в столбце "Текущий месяц"
+    # дни в окне запроса (для информации; сейчас всегда 1, потому что запрос за вчера)
     pace_window_start = max(start, period_start)
-    days_passed_window = max(1, (today - pace_window_start).days + 1)
+    days_passed_window = max(1, (period_end - pace_window_start).days + 1)
 
     limit_kind, limit = _pick_active_limit(c)
     limit_unit = limit.unit if limit else "none"
-    today_fact, period_fact = c.fact_for_unit(limit_unit) if limit else (0.0, 0.0)
+    # окно у нас = вчера (1 день), значит period_fact из Hybrid'а — это и есть факт вчера
+    _today_fact_unused, yesterday_fact = c.fact_for_unit(limit_unit) if limit else (0.0, 0.0)
     lifetime_fact = c.lifetime_fact(limit_unit) if limit else 0.0
 
     daily_target: Optional[float] = None
@@ -80,17 +84,21 @@ def compute_pace(
         else:
             daily_target = limit.amount / days_passed_from_start
 
-    pace_today: Optional[float] = None
+    pace_yesterday: Optional[float] = None
     pace_overall: Optional[float] = None
     if daily_target and daily_target > 0:
-        pace_today = today_fact / daily_target
-        if has_end_date:
-            # есть дата окончания → pace_overall меряем по всему жизненному циклу
-            # кампании: что накопилось от старта до сегодня против ожидаемого
-            # за это же количество дней.
-            expected_by_today = daily_target * min(days_passed_from_start, days_total or days_passed_from_start)
-            if expected_by_today > 0:
-                pace_overall = lifetime_fact / expected_by_today
+        pace_yesterday = yesterday_fact / daily_target
+        if has_end_date and days_total:
+            # ПРОГНОЗ выполнения плана за весь период start..end:
+            # projected_total = (что уже открутили) + (что докрутят оставшимися днями
+            #                   с темпом = вчера). Сравниваем с планом за весь период.
+            # > 100% — перевыполнит план, < 100% — недокрутит.
+            planned_total = daily_target * days_total
+            days_remaining = max(0, (end - today).days)  # сегодня уже сегодня
+            projected_remaining = (yesterday_fact or 0) * days_remaining
+            projected_total = lifetime_fact + projected_remaining
+            if planned_total > 0:
+                pace_overall = projected_total / planned_total
         # без даты окончания pace_overall не определён (см. _decide_signal)
 
     signal, reason = _decide_signal(
@@ -101,9 +109,9 @@ def compute_pace(
         today=today,
         days_left=days_left,
         limit_kind=limit_kind,
-        pace_today=pace_today,
+        pace_yesterday=pace_yesterday,
         pace_overall=pace_overall,
-        today_fact=today_fact,
+        yesterday_fact=yesterday_fact,
         status=c.status,
     )
 
@@ -127,13 +135,13 @@ def compute_pace(
         limit_unit=limit_unit,
         daily_target=daily_target,
         period_budget=period_budget,
-        today_fact=today_fact,
-        period_fact=period_fact,
+        yesterday_fact=yesterday_fact,
+        period_fact=yesterday_fact,  # алиас для совместимости со старыми клиентами
         today_spent=c.todaySum,
         period_spent=c.totalPeriodSum,
         total_spent=c.totalSum,
         impressions_total=c.totalPeriodImpressions,
-        pace_today=pace_today,
+        pace_yesterday=pace_yesterday,
         pace_overall=pace_overall,
         signal=signal,
         signal_reason=reason,
@@ -149,55 +157,58 @@ def _decide_signal(
     today: date,
     days_left: Optional[int],
     limit_kind: str,
-    pace_today: Optional[float],
+    pace_yesterday: Optional[float],
     pace_overall: Optional[float],
-    today_fact: float,
+    yesterday_fact: float,
     status: int,
 ) -> tuple[SignalLevel, str]:
     if start > today:
         return SignalLevel.NOT_STARTED, "ещё не стартовала"
     if end and end < today:
         return SignalLevel.FINISHED, "уже закончилась"
-    if limit_kind == "none" or pace_today is None:
+    if limit_kind == "none" or pace_yesterday is None:
         return SignalLevel.NO_LIMIT, "лимит не настроен"
 
-    pct_today = int(round((pace_today or 0) * 100))
+    pct_yesterday = int(round((pace_yesterday or 0) * 100))
 
     if not has_end_date:
         # Без даты окончания (или isDontExpire) — общего лимита быть не может,
-        # ориентируемся только на дневной.
-        if pace_today >= 1.0:
+        # ориентируемся только на дневной (по факту за вчера).
+        if pace_yesterday >= 1.0:
             return (
                 SignalLevel.GREEN,
-                f"идёт по плану по суточному: {pct_today}% (нет даты окончания — общий план не считаем)",
+                f"вчера выполнила суточный: {pct_yesterday}% (нет даты окончания — общий план не считаем)",
             )
-        if pace_today >= 0.7:
+        if pace_yesterday >= 0.7:
             return (
                 SignalLevel.YELLOW,
-                f"отстаёт по суточному: {pct_today}% от дневного (норма ≥100%, нет даты окончания)",
+                f"вчера отстала по суточному: {pct_yesterday}% (норма ≥100%, нет даты окончания)",
             )
         return (
             SignalLevel.RED,
-            f"сильно отстаёт по суточному: {pct_today}% от дневного (красный <70%, нет даты окончания)",
+            f"вчера сильно недокрутила: {pct_yesterday}% от дневного (красный <70%, нет даты окончания)",
         )
 
-    # Есть end_date — основная метрика pace_overall по всему периоду start..end.
+    # Есть end_date — основная метрика: прогноз выполнения плана за период.
     if pace_overall is None:
         return SignalLevel.NO_LIMIT, "лимит не настроен"
 
     pct = int(round(pace_overall * 100))
-    tail = f", {days_left} дн. до конца" if days_left is not None else ""
+    tail = f", осталось {days_left} дн." if days_left is not None else ""
     if pace_overall >= 1.0:
         return (
             SignalLevel.GREEN,
-            f"идёт по плану: {pct}% от плана периода (start–end), сегодня {pct_today}% от дневного{tail}",
+            f"прогноз: {pct}% от плана периода (выполнит/перевыполнит при текущем темпе), "
+            f"вчера {pct_yesterday}% от дневного{tail}",
         )
     if pace_overall >= 0.7:
         return (
             SignalLevel.YELLOW,
-            f"отстаёт: {pct}% от плана периода (норма ≥100%), сегодня {pct_today}% от дневного{tail}",
+            f"прогноз: {pct}% от плана периода (немного не дотянет, норма ≥100%), "
+            f"вчера {pct_yesterday}% от дневного{tail}",
         )
     return (
         SignalLevel.RED,
-        f"сильно отстаёт: {pct}% от плана периода (красный <70%), сегодня {pct_today}% от дневного{tail}",
+        f"прогноз: {pct}% от плана периода (сильно не дотянет, красный <70%), "
+        f"вчера {pct_yesterday}% от дневного{tail}",
     )

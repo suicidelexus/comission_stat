@@ -1,6 +1,6 @@
 # DSP Pacing
 
-Сервис мониторинга pace кампаний в Hybrid DSP. Тянет статистику через внутренний API кабинета `console.hybrid.ai`, считает выполнение лимитов по дням месяца (MTD), помечает кампании сигналом green/yellow/red. Зелёный = «pace ≥ 1.0, кампания сегодня крутит, есть запас по времени → можно поднять техкост».
+Сервис мониторинга pace кампаний в Hybrid DSP. Тянет статистику через внутренний API кабинетов Hybrid'а (`console.hybrid.ai`, `console.selfclick.pro`, …), считает выполнение лимитов **за вчерашний день**, помечает кампании сигналом green/yellow/red. Зелёный = «вчера выполнила суточный И прогноз показывает выполнение плана за период → можно поднять техкост».
 
 ## Запуск
 
@@ -15,144 +15,189 @@ cp .env.example .env   # заполнить (см. ниже)
 
 ## .env (секреты, в `.gitignore`)
 
-- `HYBRID_HOST=console.hybrid.ai` — главный кабинет, **видит все agencies сразу**
-- `HYBRID_COOKIES="aft=...; csid=..."` — берутся в браузере: F12 → Application → Cookies → `console.hybrid.ai`
-- `HYBRID_USER_ID=8902` — извлекается из URL-параметра запроса `/core/login/ChangeAccount?userId=...&accountId=...`
-- `HYBRID_AGENCY_IDS=ag1,ag2,...` — список 24-hex id агентств. Список «всех доступных» получается через `GET /agencies?only_named=true` после старта.
+**Кабинет 1 (обязательный):**
+- `HYBRID_HOST=console.hybrid.ai` — главный кабинет
+- `HYBRID_AGENCY_LABEL=Hybrid` — короткий ярлык (показывается в UI префиксом `[Hybrid]`)
+- `HYBRID_COOKIES="aft=...; csid=..."` — F12 → Application → Cookies → этого хоста
+- `HYBRID_USER_ID=8902` — из URL-параметра `/core/login/ChangeAccount?userId=...&accountId=...`
+- `HYBRID_AGENCY_IDS=...` — 24-hex id через запятую. Пусто = все доступные.
+
+**Кабинет 2 (опциональный):**
+- `HYBRID_HOST_2=console.selfclick.pro` — если пусто, второй tenant не подключается
+- `HYBRID_AGENCY_LABEL_2=Selfclick`
+- `HYBRID_COOKIES_2="aft=...; csid=..."`
+- `HYBRID_USER_ID_2=17457`
+- `HYBRID_AGENCY_IDS_2=` — пусто = все 13 agencies у Selfclick
+
+**Прочее:**
+- `AUTO_SYNC_TIME=03:00` — ежедневный авто-синк в это время локального времени (или `off`)
+- `FETCH_CONCURRENCY=30` — параллельных запросов внутри agency
+- `SKIP_ADVERTISER_NAME_REGEX` — regex для скипа явно мусорных advertiser'ов
 
 ## Архитектура и важные нюансы
 
 ### Иерархия Hybrid
 
 ```
-TradingDesk (кабинет — example: console.hybrid.ai)
-  └── Agency  (1148 доступных в master-кабинете hybrid.ai)
-       └── Advertiser (от 1 до 7500+ в агентстве, например Cian.ru)
+TradingDesk == кабинет (host)
+  └── Agency  (от 13 до 1148 в зависимости от кабинета)
+       └── Advertiser
             └── Campaign
 ```
 
-Все статусы и метрики живут на уровне Campaign. Pace считаем по кампаниям.
+Один host = один TD = свои куки = свой набор agencies. **`console.hybrid.ai`** — master-кабинет, видит 1148 agencies; **`console.selfclick.pro`** — отдельный TD на 13 agencies. Каждый — отдельный tenant в нашей конфигурации.
 
 ### Stateful сессия Hybrid
 
-Это критично. Сервер Hybrid'а помнит **активное агентство** в `csid` cookie. Чтобы посмотреть кампании другого агентства — нужно вызвать `GET /core/login/ChangeAccount?userId=X&accountId=Y`, и сервер обновит `csid` через `Set-Cookie`.
+Сервер Hybrid'а помнит **активное агентство** в `csid` cookie. Чтобы посмотреть рекламодателей другого agency — нужно вызвать `GET /core/login/ChangeAccount?userId=X&accountId=Y`, и сервер обновит `csid` через `Set-Cookie`.
 
 Из-за этого:
-- **Нельзя параллельно вызывать ChangeAccount разных агентств** в одном клиенте — `csid` гонится. У нас уже был баг с двумя параллельными `/summary` запросами, видно в логах.
-- Защита: `asyncio.Lock` на `_fetch_all_campaigns` в `app/main.py` — только один sync одновременно.
-- **Внутри одного агентства** можно параллелить `GetTotal` (он не меняет `csid`) — это делается через `asyncio.Semaphore(settings.fetch_concurrency)`.
+- **Нельзя параллельно вызывать ChangeAccount разных agency в одном клиенте** — `csid` гонится. Защита: `asyncio.Lock` на `_fetch_all_campaigns` в `app/main.py`.
+- **Внутри одного agency** GetTotal'ы тащим параллельно через `asyncio.Semaphore(FETCH_CONCURRENCY=30)`.
+- **Разные tenant'ы** — это разные httpx-клиенты с разными cookie jar, друг другу csid не ломают, но всё равно ходят последовательно tenant-за-tenant'ом (sequential по agencies внутри tenants).
 
-### Найденные endpoint'ы Hybrid
+### Endpoint'ы Hybrid (важные)
 
-Все на `https://console.hybrid.ai`. Кука `aft` (auth) + `csid` (session). Header `X-Requested-With: XMLHttpRequest`.
+Все на `https://{host}`. Кука `aft` (auth) + `csid` (session, обновляется после ChangeAccount). Header `X-Requested-With: XMLHttpRequest`.
 
 | Endpoint | Что | Заметки |
 |---|---|---|
-| `GET /core/account/GetSelfAccounts` | Все agencies/advertisers/td доступные user'у | 1248 записей у Ромчика. Поле `type`: "Agency" \| "Advertiser". |
-| `GET /core/login/ChangeAccount?userId=X&accountId=Y` | Переключить активное agency в сессии | Возвращает 302, новый `csid` в `Set-Cookie`. |
-| `GET /core/advertisers/GetAll` | Рекламодатели **активного** agency | Поля: id, name, balance, currency, domain. |
-| `POST /core/agencyStatistic/GetTotal?advertiserId=...&startDate=...&endDate=...&campaignFilter=0&timeZoneId=305` | Список кампаний + статистика | Body: `{"fields":[2,4,58,60,59,43,1,76,77,62,61,7,6],"dynamicFields":[],...}`. Возвращает `campaigns[]` со всеми лимитами и фактами. |
+| `GET /core/account/GetSelfAccounts` | Все agencies/advertisers доступные user'у | Возвращает массив `{id, name, type, inventoryId, roles}`. Привязки к TD НЕТ. |
+| `GET /core/login/ChangeAccount?userId=X&accountId=Y` | Переключить активное agency | Возвращает 302, новый `csid` в `Set-Cookie`. |
+| `GET /core/advertisers/GetAll` | Рекламодатели **активного** agency | После ChangeAccount возвращает только его advertiser'ов. |
+| `POST /core/agencyStatistic/GetTotal?advertiserId=...&startDate=...&endDate=...&campaignFilter=0&timeZoneId=305` | Кампании + статистика | Body: `{"fields":[2,4,58,60,59,43,1,76,77,62,61,7,6],"dynamicFields":[],...}`. |
 
-Lightweight endpoint'а только-кампаний без статистики у Hybrid **нет** — фронт сам дёргает `GetTotal` чтобы показать список.
+**Lightweight endpoint'а только-кампаний без статистики нет** — фронт сам дёргает `GetTotal` чтобы показать список.
+
+### КРИТИЧЕСКИЙ нюанс полей ответа `GetTotal`
+
+Поля кампании в ответе ведут себя **не так как кажется по имени** (проверено эмпирически в `scripts/probe_lujo.py`):
+
+| Поле | Что на самом деле | Зависит от окна? |
+|---|---|---|
+| `todaySum` / `todayImpressions` | Расход **за сегодня** (по серверу Hybrid'а) | НЕТ — константа |
+| `totalPeriodSum` / `totalPeriodImpressions` | **Lifetime** — с самого старта кампании | НЕТ — константа |
+| `totalSum` / `impressionCount` | Расход **за переданное окно** `startDate..endDate` | ДА — меняется |
+
+То есть **наш «вчера»** = `totalSum` / `impressionCount` при запросе с окном `[вчера, вчера]`. **Не `totalPeriodSum`!** На этом был баг (см. `app/models.py` → `fact_for_unit` vs `lifetime_fact`).
 
 ### Pace-логика (`app/pacing.py`)
 
-Окно: **MTD** — с 1 числа текущего месяца по сегодня (`start = today.replace(day=1)`).
+Запрос всегда за **вчера** (полный закрытый день — даёт честную картину для решения о техкосте).
 
-Лимит выбирается в порядке приоритета: `dailyMultiPriceLimitations` → `periodBudgetMultiPriceLimitations` → `totalMultiPriceLimitations`.
+```python
+end = today - timedelta(days=1)  # вчера
+start = end                       # окно = 1 день
+```
+
+Лимит выбирается по приоритету: `dailyMultiPriceLimitations` → `periodBudgetMultiPriceLimitations` → `totalMultiPriceLimitations`.
 
 **`priceFormationType` определяет единицу:**
-- `1` → **показы** (impressions). Сравниваем с `todayImpressions` / `totalPeriodImpressions`.
-- `3` → **рубли**. Сравниваем с `todaySum` / `totalPeriodSum`.
-- `2` → клики (не встречал в данных Ромчика, но поддерживается).
+- `1` → **показы** (impressions) — сравниваем с todayImpressions/impressionCount
+- `3` → **деньги** (валюта рекламодателя) — сравниваем с todaySum/totalSum
+- `2` → клики (на практике не встречается)
 
-**Pace:**
+**Две ключевые метрики:**
+
+**`pace_yesterday`** = `yesterday_fact / daily_target`
+Сколько % дневного лимита кампания выкрутила вчера. Это **основной сигнал для текущего решения** (поднимать ли техкост сейчас).
+
+**`pace_overall`** (отображается как **«% прогноз»**) — прогноз выполнения плана за весь период `start..end`:
+```python
+planned_total   = daily_target * days_total       # сколько должно быть к концу
+already_done    = lifetime_fact                   # с начала кампании по сегодня
+daily_rate      = yesterday_fact                  # текущий темп (вчера)
+projected_rest  = daily_rate * days_remaining     # допроект на оставшиеся дни
+projected_total = already_done + projected_rest
+pace_overall    = projected_total / planned_total
 ```
-daily_target = limit.amount  (если daily)
-             | period_budget / days_total  (если period budget)
-pace_today   = today_fact / daily_target
-pace_overall = period_fact / (daily_target × days_passed_in_window)
-```
 
-**GREEN** = `pace_overall >= 1.0` И `today_fact > 0` (кампания крутит сегодня, не на паузе) И есть запас по `days_left` (≥3 дня или `isDontExpire`).
+- `>= 1.0` — выполнит/перевыполнит план при текущем темпе
+- `0.7–1.0` — немного не дотянет
+- `< 0.7` — сильно не дотянет
+- Для `isDontExpire` кампаний (без `end_date`) не считается → в UI пишет «нет даты».
 
-### Status кодов кампании
+**Решение GREEN** принимается на основе обеих метрик в `_decide_signal`. У кампаний без `end_date` смотрим только `pace_yesterday`. У кампаний с `end_date` — `pace_overall` (прогноз) как первоочередной.
 
-- `1` — активна
-- `2` — на паузе (deal у Ромчика — точное значение неизвестно, но `today_fact=0` подтверждает что не крутит)
-- остальные не встречали
+### Stale-фильтрация во время sync
 
-В UI фильтр `only_active` отсекает всё кроме `status=1`.
+После compute_pace мы **отбрасываем** кампании которые не интересны для принятия решения:
+- `status != 1` (paused/draft/etc) — `dropped["paused"]`
+- `signal == FINISHED` — кампания уже закончилась
+- `signal == NOT_STARTED`
+- `signal == NO_LIMIT` — лимит не настроен
+- `yesterday_fact <= 0` — вчера ничего не открутила (на паузе по факту)
+- `end_date < завтра` — заканчивается сегодня, поднимать техкост бесполезно
 
-### Важно: НЕ фильтровать по `advertiser.balance`
+В кэше остаются только активные green/yellow/red. UI это и показывает.
 
-Был баг — фильтровали `balance > 0` перед `GetTotal`. **Сломалось**: деньги могут быть перенесены с advertiser-баланса на саму кампанию, при этом `advertiser.balance=0`, но кампании активны. Зелёные кампании пропадали.
+### Важно: НЕ фильтровать advertiser'ов по `balance`
 
-Сейчас фильтруем только по имени (`for deleting`, `archive`, `test`) — это явный мусор.
+Был баг — фильтровали `balance > 0` перед `GetTotal`. Сломалось: деньги могут быть перенесены с advertiser-баланса на саму кампанию, при этом `advertiser.balance=0`, но кампании активны. Сейчас фильтруем только по имени regex'ом (`for deleting`, `archive`, `test`).
 
 ## Производительность
 
-Первый full sync по 29 агентствам ~**11 минут** (там Cian.ru с 7522 advertiser'ами). Распределение времени:
-- Cian.ru сам по себе ~9 минут (7522 advertiser'а × ~0.07 сек/запрос с semaphore=30).
-- Остальные 28 агентств ~2 минуты в сумме.
+- 17 agencies hybrid.ai + 13 selfclick.pro = **30 agencies**, full sync ~**7 минут**
+- Жирные agencies (Cian.ru — 7500 advertiser'ов) превращали sync в 11+ минут — Ромчик их пока не включал в скоуп.
+- Кэш `cache.json` в корне (в `.gitignore`) — снимок последнего sync'а. Грузится на старте, переписывается после каждого успешного sync'а. UI и `/cache/*` отдают мгновенно.
 
-**Результат full sync'а (на момент написания):** 24 875 кампаний, из них:
-- 🟢 green: 216
-- 🟡 yellow: 128
-- 🔴 red: 3 982
-- ⚫ finished: 20 542
-- ⚪ no_limit: 7
+## Авто-синк и алерт кук
 
-Из 8000+ advertiser'ов с кампаниями в мае было **4302**. Это и есть «white list» для smart cache (см. ниже TODO).
+**Авто-синк:** на старте FastAPI запускается фоновый task (`_auto_sync_loop`), который спит до ближайшего `AUTO_SYNC_TIME` и вызывает `_run_sync_background()`. Без cron'а / launchd, всё внутри процесса.
 
-## Кэш
-
-`cache.json` в корне (в `.gitignore`). Полный snapshot последнего sync'а — `{at, items}`. Загружается на старте в lifespan, сохраняется после каждого успешного sync'а. Это позволяет:
-- Перезапустить сервис — UI сразу работает с прежним кэшем.
-- Endpoint'ы `/cache/*` отдают данные мгновенно.
-
-Lock-протекция на `/summary`, `/campaigns`, `/campaigns/green` — один блокирующий sync (11 мин). Юзеру стоит дёргать только `/cache/*`.
+**Алерт кук:** при первом 401/403 от Hybrid'а пишем в глобальный `_auth_health`, endpoint `GET /health/auth` отдаёт состояние. UI читает каждую минуту и при `ok: false` показывает красную плашку вверху страницы с указанием tenant'а и времени ошибки.
 
 ## Структура
 
 ```
 app/
-  config.py        # pydantic-settings, читает .env
-  models.py        # HybridCampaign + CampaignPaceOut + SignalLevel
-  hybrid_client.py # async HTTP-клиент: list_agencies, switch_to_agency, list_advertisers, get_total
-  pacing.py        # compute_pace + _decide_signal
-  main.py          # FastAPI app, lock, cache, endpoints
+  config.py         # pydantic-settings, .env, TenantConfig, settings.tenants
+  models.py         # HybridCampaign / HybridPriceLimit / CampaignPaceOut / SignalLevel
+                    # currency_code/symbol, fact_for_unit, lifetime_fact
+  hybrid_client.py  # async HTTP-клиент: list_agencies/switch_to_agency/
+                    # list_advertisers/get_total. make_client_for(tenant).
+  pacing.py         # compute_pace + _decide_signal (yesterday + forecast)
+  main.py           # FastAPI app, lock, cache, multi-tenant, auto-sync,
+                    # /health/auth, /sync/start, /sync/status
   static/
-    index.html     # UI (vanilla JS + CSS, без сборки)
-scripts/           # одноразовые probes (probe_auth.py, probe_change_account.py, find_agencies.py)
+    index.html      # UI (vanilla JS + CSS): таблица, фильтры, sync progress,
+                    # auth alert, цветные сигналы и pace badges
+scripts/            # одноразовые probes — auth, hierarchy, конкретные кампании,
+                    # match_agencies (поиск agency_id по списку имён)
 ```
 
-## Endpoint'ы
+## Endpoint'ы FastAPI
 
 - `GET /` — HTML страничка
-- `GET /cache/summary` — сводка из кэша (мгновенно)
-- `GET /cache/green` — зелёные из кэша
-- `GET /cache/all?signal=&only_active=` — всё из кэша (для UI)
-- `GET /agencies?only_named=true` — список 1148 agencies (для выбора agency_id в `.env`)
-- `GET /advertisers?agency_id=X` — рекламодатели агентства
-- `GET /summary` ⚠️ — пере-синкает (11 мин), используется для refresh
-- `GET /campaigns?signal=&only_active=` — то же что summary, возвращает массив
-- `GET /campaigns/green` — зелёные через пере-синк (не нужно, дёргай `/cache/green`)
+- `GET /cache/summary` — сводка по сигналам (мгновенно из памяти)
+- `GET /cache/green` — только зелёные
+- `GET /cache/all?signal=` — всё из кэша (используется UI)
+- `GET /agencies?only_named=true&tenant=` — список agencies всех кабинетов (или одного)
+- `GET /advertisers?agency_id=&tenant=` — рекламодатели agency
+- `POST /sync/start` — запускает фоновый sync (под глобальным `_sync_lock`)
+- `GET /sync/status` — прогресс текущего/последнего sync'а (для прогресс-бара UI)
+- `GET /summary` ⚠️ — блокирующий sync (~7 мин)
+- `GET /campaigns?signal=&only_active=` — то же, массивом
+- `GET /campaigns/green` — зелёные через блокирующий sync
+- `GET /health/auth` — статус кук (UI читает, чтобы показать плашку)
 - `GET /docs` — Swagger
 
-## TODO
+## TODO (что обсуждалось, не сделано)
 
-1. **Smart cache + cron loop** — раз в 15-30 минут sync только по advertiser'ам у которых были кампании в этом месяце (~500 вместо 8000) = ~1-2 минуты вместо 11. Раз в 6 часов full refresh для новых advertiser'ов.
-2. **Postgres + история pace** — копить snapshots, считать «стабильно green N дней подряд» (изначальный замысел).
-3. **Обновление кук** — когда `aft`/`csid` протухнут, текущая логика кинет 401 в `/cache/*` пустоту не отдаёт. Нужен алерт «куки протухли, обнови в .env».
-4. **Telegram бот** — был выкинут из MVP, но как опция.
+1. **История pace за N дней** — копить snapshots по дням, показывать «🟢🟢🟢 стабильно N дней» как дополнительный сигнал.
+2. **«Отметить как обработано»** — чекбоксы в UI чтоб помечать кампании на которых техкост уже подняли (с фильтром «скрыть обработанные»).
+3. **Экспорт в CSV** — выгрузка результатов sync'а.
+4. **Telegram бот** — пуш зелёных по расписанию.
+5. **Postgres** — переезд кэша/истории из файла в БД.
+6. **Smart cache** — incremental sync только по advertiser'ам с кампаниями, full раз в сутки. Актуально если когда-нибудь добавим Cian.ru-подобные жирные agencies.
 
 ## История ключевых решений
 
-- **Кабинет hybrid.ai** вместо отдельных белых лейблов (artics.ru, hybrid.ru, ...) — из master-кабинета `console.hybrid.ai` видны все 1148 агентств. Один host = одни куки = много agencies.
-- **MTD окно** — Ромчик попросил период «с 1 числа текущего месяца по сегодня». В коде: `end = today; start = today.replace(day=1)`.
-- **Не фильтруем balance** — баланс может быть на кампании, не у рекламодателя.
-- **GREEN требует today_fact > 0** — иначе любая старая хорошая кампания на паузе светилась зелёной.
+- **Окно запроса = вчера** (не MTD, не сегодня). Сегодня не закончилось — нет полной статистики. Вчера — единственный валидный day для решения о техкосте.
+- **`totalSum` ≠ lifetime** — в API Hybrid'а это window-fact, а lifetime сидит в `totalPeriodSum`. Перепутывание давало pace_yesterday в 200x от реальности.
+- **`pace_overall` = forecast**, а не lifetime-average. Историческое среднее (как было раньше) не реагирует на текущие изменения и бесполезно для решения. Forecast — «выполнит ли план до end_date при текущем темпе» — это и нужно.
+- **Multi-tenant через `_2` суффикс** в .env. Просто, без yaml. Когда понадобится 3+ кабинета — обобщим.
+- **Auto-sync через asyncio task** в lifespan'е, без внешних зависимостей. Запускается каждые сутки в `AUTO_SYNC_TIME`.
 
 ## Контекст пользователя (Ромчик)
 

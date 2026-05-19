@@ -189,3 +189,13 @@ def make_client() -> HybridClient:
         user_id=settings.hybrid_user_id,
         timezone_id=settings.hybrid_timezone_id,
     )
+
+
+def make_client_for(tenant) -> "HybridClient":
+    """Создать клиент под конкретный tenant (см. config.TenantConfig)."""
+    return HybridClient(
+        host=tenant.host,
+        cookies_header=tenant.cookies,
+        user_id=tenant.user_id,
+        timezone_id=settings.hybrid_timezone_id,
+    )

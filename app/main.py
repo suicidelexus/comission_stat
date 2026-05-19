@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
 
 from pathlib import Path
@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .hybrid_client import Account, Advertiser, HybridAuthError, make_client
+from .hybrid_client import Account, Advertiser, HybridAuthError, HybridClient, make_client_for
 from .models import CampaignPaceOut, SignalLevel
 from .pacing import compute_pace
 
@@ -31,6 +31,16 @@ _sync_lock = asyncio.Lock()
 # Простой in-memory кэш последнего успешного sync'а
 _cache: dict[str, list[CampaignPaceOut]] = {"items": []}
 _cache_ts: dict[str, Optional[str]] = {"at": None}
+
+# Здоровье авторизации: пишем сюда первый 401/403 (куки протухли).
+# UI читает /health/auth и показывает плашку.
+_auth_health: dict = {
+    "ok": True,
+    "tenant": None,
+    "error": None,
+    "at": None,
+}
+
 
 # Прогресс текущего/последнего синка — отдаётся в /sync/status для прогресс-бара.
 _sync_progress: dict = {
@@ -80,15 +90,62 @@ def _save_cache_to_disk() -> None:
         log.warning("disk cache save failed: %s", e)
 
 
+def _parse_hhmm(s: str) -> Optional[dtime]:
+    s = (s or "").strip().lower()
+    if not s or s == "off":
+        return None
+    try:
+        hh, mm = s.split(":")
+        return dtime(int(hh), int(mm))
+    except Exception:
+        log.warning("bad AUTO_SYNC_TIME=%r — ignored", s)
+        return None
+
+
+async def _auto_sync_loop() -> None:
+    """Каждый день в HH:MM локального времени сервера запускает sync."""
+    target = _parse_hhmm(settings.auto_sync_time)
+    if target is None:
+        log.info("auto-sync disabled (AUTO_SYNC_TIME)")
+        return
+    log.info("auto-sync armed for %s daily (local time)", target.strftime("%H:%M"))
+    while True:
+        now = datetime.now()
+        next_run = now.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        delay = (next_run - now).total_seconds()
+        log.info("auto-sync next run at %s (in %.0fs)", next_run, delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            log.info("auto-sync loop cancelled")
+            return
+        log.info("auto-sync firing")
+        try:
+            await _run_sync_background()
+        except Exception:
+            log.exception("auto-sync run failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_cache_from_disk()
-    app.state.hybrid = make_client()
+    # Создаём по клиенту на каждый tenant из конфига (hybrid.ai, selfclick.pro, ...)
+    tenants = settings.tenants
+    app.state.tenants = tenants
+    app.state.hybrids: dict[str, HybridClient] = {
+        t.label: make_client_for(t) for t in tenants
+    }
+    log.info("tenants loaded: %s", [t.label for t in tenants])
+    app.state.auto_sync_task = asyncio.create_task(_auto_sync_loop())
     try:
         yield
     finally:
+        app.state.auto_sync_task.cancel()
         _save_cache_to_disk()
-        await app.state.hybrid.close()
+        for c in app.state.hybrids.values():
+            await c.close()
 
 
 app = FastAPI(
@@ -99,15 +156,15 @@ app = FastAPI(
 )
 
 
-async def _resolve_agencies() -> list[Account]:
-    """Возвращает список агентств, по которым работаем."""
-    client = app.state.hybrid
+async def _resolve_agencies_for(tenant, client: HybridClient) -> list[Account]:
+    """Возвращает список агентств этого кабинета (с учётом фильтра agency_ids)."""
     try:
         all_agencies = await client.list_agencies()
     except HybridAuthError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        _auth_health.update(ok=False, tenant=tenant.label, error=str(e), at=datetime.utcnow().isoformat())
+        raise HTTPException(status_code=401, detail=f"[{tenant.label}] {e}")
 
-    wanted = set(settings.agency_ids)
+    wanted = set(tenant.agency_ids)
     if not wanted:
         return all_agencies
     return [a for a in all_agencies if a.id in wanted]
@@ -122,25 +179,36 @@ async def _fetch_all_campaigns() -> list[CampaignPaceOut]:
 
 
 async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
-    client = app.state.hybrid
-    end = date.today()
-    start = end.replace(day=1)
-    tomorrow = end.toordinal() + 1
+    # Запрашиваем стату за ВЧЕРАШНИЙ день (полный закрытый день).
+    # Решение о техкосте принимаем по тому как вчера кампания выполнила лимит.
+    today = date.today()
+    end = today - timedelta(days=1)
+    start = end
+    tomorrow_ord = today.toordinal() + 1
 
-    agencies = await _resolve_agencies()
+    tenants = app.state.tenants
+    # Собираем плоский список (tenant, agency) — чтобы прогресс шёл по всему скоупу
+    agency_jobs: list[tuple[object, Account]] = []
+    for t in tenants:
+        client = app.state.hybrids[t.label]
+        for ag in await _resolve_agencies_for(t, client):
+            agency_jobs.append((t, ag))
+
     out: list[CampaignPaceOut] = []
-    dropped = {"not_started": 0, "finished": 0, "no_limit": 0, "paused": 0, "no_fact_today": 0, "ends_today": 0}
+    dropped = {"not_started": 0, "finished": 0, "no_limit": 0, "paused": 0, "no_fact_yesterday": 0, "ends_today": 0}
 
-    _sync_progress.update(total=len(agencies), current=0, current_agency="", agencies_done=0, campaigns_collected=0)
+    _sync_progress.update(total=len(agency_jobs), current=0, current_agency="", agencies_done=0, campaigns_collected=0)
 
-    for ai, agency in enumerate(agencies, 1):
-        agency_label = agency.name or agency.id
+    for ai, (tenant, agency) in enumerate(agency_jobs, 1):
+        client = app.state.hybrids[tenant.label]
+        agency_label = f"[{tenant.label}] {agency.name or agency.id}"
         _sync_progress.update(current=ai, current_agency=agency_label)
-        log.info("[%d/%d] agency %s (%s) — switching", ai, len(agencies), agency_label, agency.id)
+        log.info("[%d/%d] %s — switching", ai, len(agency_jobs), agency_label)
         try:
             await client.switch_to_agency(agency.id)
             advertisers = await client.list_advertisers()
         except HybridAuthError as e:
+            _auth_health.update(ok=False, tenant=tenant.label, error=str(e), at=datetime.utcnow().isoformat())
             raise HTTPException(status_code=401, detail=str(e))
         except Exception as e:
             log.warning("agency %s skipped: %s", agency.id, e)
@@ -169,7 +237,7 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
                     return []
             return [
                 compute_pace(
-                    agency=agency.name or agency.id,
+                    agency=f"[{tenant.label}] {agency.name or agency.id}",
                     advertiser_id=adv.id,
                     advertiser_name=adv.name or "",
                     currency=adv.currency,
@@ -196,12 +264,12 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
                     dropped["no_limit"] += 1
                     log.info("    no_limit: %s/%s (%s)", agency_label, p.campaign_name, p.campaign_id)
                     continue
-                if p.today_fact <= 0:
-                    dropped["no_fact_today"] += 1
+                if p.yesterday_fact <= 0:
+                    dropped["no_fact_yesterday"] += 1
                     continue
                 # завтра ещё крутит?
                 if not p.is_dont_expire:
-                    if p.end_date is None or p.end_date.toordinal() < tomorrow:
+                    if p.end_date is None or p.end_date.toordinal() < tomorrow_ord:
                         dropped["ends_today"] += 1
                         continue
                 out.append(p)
@@ -215,6 +283,8 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
     _cache["items"] = out
     _cache_ts["at"] = datetime.utcnow().isoformat()
     _save_cache_to_disk()
+    # Sync дошёл до конца — значит куки рабочие, чистим флаг
+    _auth_health.update(ok=True, tenant=None, error=None, at=None)
     return out
 
 
@@ -226,26 +296,62 @@ async def health() -> dict:
     return {"ok": True}
 
 
-@app.get("/agencies", response_model=list[Account])
-async def agencies(only_named: bool = Query(True, description="скрыть агентства без имени")):
-    """Список агентств доступных текущим кукам. Удобно чтоб выбрать какие
-    положить в HYBRID_AGENCY_IDS."""
-    accs = await _resolve_agencies() if settings.agency_ids else await app.state.hybrid.list_agencies()
-    if only_named:
-        accs = [a for a in accs if a.name.strip()]
-    return accs
+@app.get("/health/auth")
+async def health_auth() -> dict:
+    """Статус кук — UI читает чтобы показать плашку «обнови HYBRID_COOKIES»."""
+    target = _parse_hhmm(settings.auto_sync_time)
+    return {
+        **_auth_health,
+        "auto_sync_time": target.strftime("%H:%M") if target else None,
+    }
+
+
+@app.get("/agencies")
+async def agencies(
+    only_named: bool = Query(True, description="скрыть агентства без имени"),
+    tenant: Optional[str] = Query(None, description="label кабинета; пусто = все"),
+):
+    """Список агентств всех кабинетов (или одного, если ?tenant=label).
+    Удобно чтоб выбрать какие положить в HYBRID_AGENCY_IDS / _2."""
+    out: list[dict] = []
+    for t in app.state.tenants:
+        if tenant and t.label != tenant:
+            continue
+        client = app.state.hybrids[t.label]
+        try:
+            accs = await client.list_agencies()
+        except HybridAuthError as e:
+            raise HTTPException(status_code=401, detail=f"[{t.label}] {e}")
+        for a in accs:
+            if only_named and not a.name.strip():
+                continue
+            out.append({**a.model_dump(), "tenant": t.label})
+    return out
 
 
 @app.get("/advertisers")
-async def advertisers_of(agency_id: str = Query(..., description="agency_id")):
+async def advertisers_of(
+    agency_id: str = Query(..., description="agency_id"),
+    tenant: Optional[str] = Query(None, description="label кабинета (если agency только в одном — можно опустить)"),
+):
     """Список рекламодателей конкретного агентства."""
-    client = app.state.hybrid
-    try:
-        await client.switch_to_agency(agency_id)
-        advs = await client.list_advertisers()
-    except HybridAuthError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    return advs
+    tenants = app.state.tenants
+    if tenant:
+        tenants = [t for t in tenants if t.label == tenant]
+        if not tenants:
+            raise HTTPException(status_code=404, detail=f"tenant '{tenant}' not found")
+    last_err: Optional[Exception] = None
+    for t in tenants:
+        client = app.state.hybrids[t.label]
+        try:
+            await client.switch_to_agency(agency_id)
+            return await client.list_advertisers()
+        except HybridAuthError as e:
+            raise HTTPException(status_code=401, detail=f"[{t.label}] {e}")
+        except Exception as e:
+            last_err = e
+            continue
+    raise HTTPException(status_code=404, detail=f"agency {agency_id} not found: {last_err}")
 
 
 @app.get("/campaigns", response_model=list[CampaignPaceOut])
@@ -266,7 +372,7 @@ async def list_campaigns(
         SignalLevel.NOT_STARTED: 4,
         SignalLevel.FINISHED: 5,
     }
-    items.sort(key=lambda x: (order.get(x.signal, 9), -(x.pace_today or 0)))
+    items.sort(key=lambda x: (order.get(x.signal, 9), -(x.pace_yesterday or 0)))
     return items
 
 

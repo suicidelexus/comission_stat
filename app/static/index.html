@@ -22,6 +22,11 @@
   #sync-bar .track { background: #0f1419; border-radius: 4px; height: 6px; margin-top: 8px; overflow: hidden; }
   #sync-bar .fill { background: var(--blue); height: 100%; width: 0%; transition: width 0.4s ease; }
 
+  /* auth alert */
+  #auth-alert { display: none; background: rgba(248,113,113,0.12); border: 1px solid rgba(248,113,113,0.5); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; color: var(--red); }
+  #auth-alert.visible { display: block; }
+  #auth-alert b { color: var(--red); }
+
   /* summary pills */
   .summary { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
   .pill { padding: 6px 12px; border-radius: 999px; font-weight: 600; font-size: 12px; background: var(--panel); cursor: pointer; user-select: none; border: 1px solid transparent; }
@@ -77,6 +82,11 @@
 
 <h1>DSP Pacing</h1>
 <div class="meta" id="meta">Загружаем кэш…</div>
+<div id="auth-alert">
+  <b>⚠ Авторизация в Hybrid сломалась.</b>
+  <span id="auth-alert-msg"></span>
+  Открой кабинет, скопируй свежие <code>aft</code>/<code>csid</code> и обнови <code>HYBRID_COOKIES</code> в <code>.env</code>, потом перезапусти сервер.
+</div>
 
 <div id="sync-bar">
   <div class="top">
@@ -108,14 +118,13 @@
   <th data-key="campaign_name">Кампания</th>
   <th data-key="limit_kind">Лимит</th>
   <th data-key="daily_target" class="num">Дневной</th>
-  <th data-key="today_fact" class="num">Сегодня</th>
-  <th data-key="period_fact" class="num">Текущий месяц</th>
-  <th data-key="pace_today" class="num">% суточный</th>
-  <th data-key="pace_overall" class="num">% за период</th>
+  <th data-key="yesterday_fact" class="num">Вчера</th>
+  <th data-key="pace_yesterday" class="num">% за вчера</th>
+  <th data-key="pace_overall" class="num" title="Прогноз выполнения плана за весь период start..end при текущем темпе (вчерашнем). 100% = выполнит ровно, >100% = перевыполнит, <100% = не дотянет">% прогноз</th>
   <th data-key="days_left" class="num">Дней до конца</th>
 </tr>
 </thead>
-<tbody id="rows"><tr><td colspan="11" class="loading">загрузка…</td></tr></tbody>
+<tbody id="rows"><tr><td colspan="10" class="loading">загрузка…</td></tr></tbody>
 </table>
 
 <script>
@@ -197,15 +206,14 @@ function render() {
       <td class="ellipsis" title="${escapeHtml(x.campaign_name)}\n\n${escapeHtml(x.signal_reason || '')}">${escapeHtml(x.campaign_name)}</td>
       <td>${limitLabel}</td>
       <td class="num">${fmtMoney(x.daily_target, x.limit_unit, sym, code)}</td>
-      <td class="num">${fmtMoney(x.today_fact, x.limit_unit, sym, code)}</td>
-      <td class="num">${fmtMoney(x.period_fact, x.limit_unit, sym, code)}</td>
-      <td class="num">${x.pace_today !== null ? `<span class="pace-badge ${paceClass(x.pace_today)}">${fmt(x.pace_today, {pct:true})}</span>` : '—'}</td>
-      <td class="num">${x.pace_overall !== null ? `<span class="pace-badge ${paceClass(x.pace_overall)}">${fmt(x.pace_overall, {pct:true})}</span>` : `<span class="muted" title="общий план не считается — нет даты окончания">нет даты</span>`}</td>
+      <td class="num">${fmtMoney(x.yesterday_fact, x.limit_unit, sym, code)}</td>
+      <td class="num">${x.pace_yesterday !== null && x.pace_yesterday !== undefined ? `<span class="pace-badge ${paceClass(x.pace_yesterday)}">${fmt(x.pace_yesterday, {pct:true})}</span>` : '—'}</td>
+      <td class="num">${x.pace_overall !== null ? `<span class="pace-badge ${paceClass(x.pace_overall)}" title="прогноз выполнения плана за период при текущем темпе (вчерашнем)">${fmt(x.pace_overall, {pct:true})}</span>` : `<span class="muted" title="прогноз не считается — нет даты окончания">нет даты</span>`}</td>
       <td class="num">${x.is_dont_expire ? '∞' : (x.days_left ?? '—')}</td>
     </tr>`;
   }).join('');
 
-  document.getElementById('rows').innerHTML = rows || `<tr><td colspan="11" class="loading">пусто</td></tr>`;
+  document.getElementById('rows').innerHTML = rows || `<tr><td colspan="10" class="loading">пусто</td></tr>`;
 }
 
 function escapeHtml(s) {
@@ -232,8 +240,23 @@ function renderSummary(byS, total) {
   });
 }
 
+async function checkAuthHealth() {
+  try {
+    const h = await fetch('/health/auth').then(r => r.json());
+    const box = document.getElementById('auth-alert');
+    if (h.ok === false) {
+      box.classList.add('visible');
+      const at = h.at ? new Date(h.at + 'Z').toLocaleString('ru-RU') : '';
+      document.getElementById('auth-alert-msg').textContent =
+        ` Tenant: ${h.tenant || '?'}. Время: ${at}. Причина: ${h.error || 'unknown'}.`;
+    } else {
+      box.classList.remove('visible');
+    }
+  } catch (_) { /* пофиг */ }
+}
+
 async function loadCache() {
-  document.getElementById('rows').innerHTML = '<tr><td colspan="11" class="loading">загружаем кэш…</td></tr>';
+  document.getElementById('rows').innerHTML = '<tr><td colspan="10" class="loading">загружаем кэш…</td></tr>';
   const [sum, items] = await Promise.all([
     fetch('/cache/summary').then(r => r.json()),
     fetch('/cache/all').then(r => r.json()),
@@ -241,11 +264,18 @@ async function loadCache() {
   allData = items;
   const byS = sum.by_signal || {};
   const ts = sum.cached_at_utc;
-  document.getElementById('meta').textContent = ts
+  // время следующего автосинка покажем в meta
+  let metaText = ts
     ? `Последний синк: ${new Date(ts + 'Z').toLocaleString('ru-RU')} • ${sum.total} активных кампаний`
     : 'Кэш пустой — нажми "синхронизировать"';
+  try {
+    const h = await fetch('/health/auth').then(r => r.json());
+    if (h.auto_sync_time) metaText += ` • автосинк ежедневно в ${h.auto_sync_time}`;
+  } catch (_) {}
+  document.getElementById('meta').textContent = metaText;
   renderSummary(byS, sum.total || 0);
   render();
+  checkAuthHealth();
 }
 
 function fmtElapsed(s) {
@@ -313,7 +343,7 @@ document.querySelectorAll('thead th[data-key]').forEach(th => {
   th.addEventListener('click', () => {
     const k = th.dataset.key;
     if (sortKey === k) sortDir = -sortDir;
-    else { sortKey = k; sortDir = k === 'pace_overall' || k === 'pace_today' ? -1 : 1; }
+    else { sortKey = k; sortDir = k === 'pace_overall' || k === 'pace_yesterday' ? -1 : 1; }
     document.querySelectorAll('thead th').forEach(h => h.textContent = h.textContent.replace(/ [↑↓]$/, ''));
     th.textContent += sortDir === 1 ? ' ↑' : ' ↓';
     render();
@@ -326,6 +356,9 @@ document.querySelectorAll('thead th[data-key]').forEach(th => {
   const st = await fetch('/sync/status').then(r => r.json()).catch(() => null);
   if (st && st.status === 'running') startPolling();
 })();
+
+// перепроверяем здоровье кук раз в минуту
+setInterval(checkAuthHealth, 60000);
 </script>
 </body>
 </html>
