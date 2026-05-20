@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, time
 from typing import Optional
@@ -83,11 +84,35 @@ class HybridClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    # ---------- HTTP с ретраями ----------
+
+    MAX_RETRIES = 4
+    RETRY_DELAYS = [0.5, 1.5, 3.0, 6.0]  # пауза перед попыткой #2,3,4,...
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """HTTP-запрос с ретраями на сетевые ошибки (ConnectTimeout/ReadTimeout/etc).
+        Один сетевой чих не должен валить весь sync."""
+        last_err: Optional[Exception] = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return await self._client.request(method, url, **kwargs)
+            except httpx.TransportError as e:
+                last_err = e
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
+                    log.warning(
+                        "%s %s — %s (retry %d/%d in %.1fs)",
+                        method, url.rsplit("/", 1)[-1], type(e).__name__,
+                        attempt + 1, self.MAX_RETRIES - 1, delay,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_err  # type: ignore[misc]
+
     # ---------- accounts (agencies / advertisers) ----------
 
     async def list_self_accounts(self) -> list[Account]:
         url = f"https://{self.host}/core/account/GetSelfAccounts"
-        r = await self._client.get(url, headers={"Accept": "application/json, text/plain, */*"})
+        r = await self._request("GET", url, headers={"Accept": "application/json, text/plain, */*"})
         self._check_auth(r)
         r.raise_for_status()
         return [Account.model_validate(x) for x in r.json()]
@@ -101,7 +126,8 @@ class HybridClient:
         if self._active_account_id == agency_id:
             return
         url = f"https://{self.host}/core/login/ChangeAccount"
-        r = await self._client.get(
+        r = await self._request(
+            "GET",
             url,
             params={"userId": self.user_id, "accountId": agency_id},
             headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
@@ -116,7 +142,8 @@ class HybridClient:
     async def list_advertisers(self) -> list[Advertiser]:
         """Рекламодатели текущего активного агентства."""
         url = f"https://{self.host}/core/advertisers/GetAll"
-        r = await self._client.get(
+        r = await self._request(
+            "GET",
             url,
             headers={
                 "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -152,7 +179,8 @@ class HybridClient:
             "conversionSortField": [],
             "metricIds": [],
         }
-        r = await self._client.post(
+        r = await self._request(
+            "POST",
             url,
             params=params,
             json=body,
