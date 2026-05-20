@@ -2,6 +2,7 @@
 .env.local
 tmp_*.json
 cache.json
+commissions_log.json
 *.pyc
 __pycache__/
 .venv/

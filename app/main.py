@@ -155,6 +155,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# --- CRM-модуль (изолирован в app/crm.py; чтобы вырезать — удалить эти 2 строки) ---
+from . import crm  # noqa: E402
+app.include_router(crm.router)
+
 
 async def _resolve_agencies_for(tenant, client: HybridClient) -> list[Account]:
     """Возвращает список агентств этого кабинета (с учётом фильтра agency_ids)."""
@@ -238,6 +242,8 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
             return [
                 compute_pace(
                     agency=f"[{tenant.label}] {agency.name or agency.id}",
+                    agency_id=agency.id,
+                    tenant=tenant.label,
                     advertiser_id=adv.id,
                     advertiser_name=adv.name or "",
                     currency=adv.currency,

@@ -46,6 +46,29 @@ class Settings(BaseSettings):
     # Пусто или "off" = выключен. По умолчанию 03:00 (3 ночи).
     auto_sync_time: str = "03:00"
 
+    # ============ CRM (создание комиссий) — ИЗОЛИРОВАННЫЙ модуль ============
+    # Вся CRM-логика в app/crm.py. Чтобы вырезать — удалить crm.py + строки
+    # подключения в main.py. Два предохранителя:
+    #   CRM_ENABLED=false  — модуль выключен полностью (по умолчанию).
+    #   CRM_DRY_RUN=true   — даже включённый только логирует, НЕ шлёт в CRM.
+    crm_enabled: bool = False
+    crm_dry_run: bool = True
+    crm_host: str = "newcrm.hybrid.ai"
+    crm_cookies: str = ""
+    # TradingDeskId — один на кабинет. Маппинг "label tenant'а -> td_id".
+    # Формат: "Hybrid:524bc2a4...,Selfclick:646c6334..."
+    crm_trading_desk_ids: str = ""
+
+    @property
+    def crm_td_map(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for pair in self.crm_trading_desk_ids.split(","):
+            pair = pair.strip()
+            if ":" in pair:
+                k, v = pair.split(":", 1)
+                out[k.strip()] = v.strip()
+        return out
+
     @property
     def agency_ids(self) -> list[str]:
         return [x.strip() for x in self.hybrid_agency_ids.split(",") if x.strip()]

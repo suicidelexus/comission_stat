@@ -71,6 +71,31 @@
   .pace-badge.yellow { background: rgba(250,204,21,0.18); color: var(--yellow); }
   .pace-badge.red { background: rgba(248,113,113,0.18); color: var(--red); }
 
+  /* CRM:start — кнопка комиссии + модалка */
+  .crm-btn { background: rgba(96,165,250,0.15); border: 1px solid var(--blue); color: var(--blue);
+    padding: 3px 9px; border-radius: 5px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .crm-btn:hover { background: rgba(96,165,250,0.3); }
+  .crm-dry { font-size: 10px; color: var(--yellow); }
+  #modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    align-items: center; justify-content: center; z-index: 100; }
+  #modal-bg.visible { display: flex; }
+  #modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px; min-width: 380px; max-width: 480px; }
+  #modal h3 { margin: 0 0 12px 0; font-size: 15px; }
+  #modal .field { margin-bottom: 10px; }
+  #modal label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  #modal input { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    padding: 8px 10px; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  #modal .info { color: var(--muted); font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
+  #modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  #modal button { padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+  #modal button.confirm { background: rgba(74,222,128,0.15); border-color: var(--green); color: var(--green); }
+  #modal button.confirm:hover { background: rgba(74,222,128,0.3); }
+  #modal .result { margin-top: 12px; font-size: 13px; padding: 8px; border-radius: 6px; }
+  #modal .result.ok { background: rgba(74,222,128,0.12); color: var(--green); }
+  #modal .result.err { background: rgba(248,113,113,0.12); color: var(--red); }
+  /* CRM:end */
+
   .ellipsis { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .muted { color: var(--muted); font-size: 11px; }
   .loading { padding: 40px; text-align: center; color: var(--muted); }
@@ -122,10 +147,29 @@
   <th data-key="pace_yesterday" class="num">% за вчера</th>
   <th data-key="pace_overall" class="num" title="Прогноз выполнения плана за весь период start..end при текущем темпе (вчерашнем). 100% = выполнит ровно, >100% = перевыполнит, <100% = не дотянет">% прогноз</th>
   <th data-key="days_left" class="num">Дней до конца</th>
+  <th id="th-crm"></th><!-- CRM:start/end колонка действия -->
 </tr>
 </thead>
-<tbody id="rows"><tr><td colspan="10" class="loading">загрузка…</td></tr></tbody>
+<tbody id="rows"><tr><td colspan="11" class="loading">загрузка…</td></tr></tbody>
 </table>
+
+<!-- CRM:start модалка создания комиссии -->
+<div id="modal-bg">
+  <div id="modal">
+    <h3>Создать комиссию (техкост)</h3>
+    <div class="info" id="modal-info"></div>
+    <div class="field">
+      <label>Размер техкоста, %</label>
+      <input type="number" id="modal-scale" step="0.1" min="0.1" max="100" placeholder="например 2" />
+    </div>
+    <div class="actions">
+      <button onclick="closeModal()">Отмена</button>
+      <button class="confirm" id="modal-confirm" onclick="submitCommission()">Создать</button>
+    </div>
+    <div class="result" id="modal-result" style="display:none"></div>
+  </div>
+</div>
+<!-- CRM:end -->
 
 <script>
 let allData = [];
@@ -210,15 +254,105 @@ function render() {
       <td class="num">${x.pace_yesterday !== null && x.pace_yesterday !== undefined ? `<span class="pace-badge ${paceClass(x.pace_yesterday)}">${fmt(x.pace_yesterday, {pct:true})}</span>` : '—'}</td>
       <td class="num">${x.pace_overall !== null ? `<span class="pace-badge ${paceClass(x.pace_overall)}" title="прогноз выполнения плана за период при текущем темпе (вчерашнем)">${fmt(x.pace_overall, {pct:true})}</span>` : `<span class="muted" title="прогноз не считается — нет даты окончания">нет даты</span>`}</td>
       <td class="num">${x.is_dont_expire ? '∞' : (x.days_left ?? '—')}</td>
+      <td>${crmCell(x)}</td>
     </tr>`;
   }).join('');
 
-  document.getElementById('rows').innerHTML = rows || `<tr><td colspan="10" class="loading">пусто</td></tr>`;
+  document.getElementById('rows').innerHTML = rows || `<tr><td colspan="11" class="loading">пусто</td></tr>`;
 }
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+// CRM:start — кнопка комиссии в строке + модалка
+let crmStatus = { enabled: false, dry_run: true };
+let modalCampaign = null;
+
+async function loadCrmStatus() {
+  try {
+    crmStatus = await fetch('/crm/status').then(r => r.json());
+  } catch (_) { crmStatus = { enabled: false, dry_run: true }; }
+}
+
+function crmCell(x) {
+  if (!crmStatus.enabled) return '';
+  if (x.signal !== 'green') return '';
+  if (!x.agency_id || !x.campaign_id) return '';
+  return `<button class="crm-btn" onclick="openCommissionModal('${x.campaign_id}')">💰 техкост</button>`;
+}
+
+function openCommissionModal(campaignId) {
+  const x = allData.find(c => c.campaign_id === campaignId);
+  if (!x) return;
+  modalCampaign = x;
+  const dryNote = crmStatus.dry_run
+    ? '<br><span class="crm-dry">⚠ DRY-RUN: запрос НЕ отправится в CRM, только залогируется.</span>'
+    : '<br><b style="color:var(--red)">БОЕВОЙ режим — комиссия создастся реально!</b>';
+  document.getElementById('modal-info').innerHTML =
+    `<b>${escapeHtml(x.campaign_name)}</b><br>` +
+    `${escapeHtml(x.agency)} → ${escapeHtml(x.advertiser_name || x.advertiser_id)}<br>` +
+    `вчера: ${x.pace_yesterday !== null ? Math.round(x.pace_yesterday*100)+'%' : '—'} от дневного` +
+    dryNote;
+  document.getElementById('modal-scale').value = '';
+  const res = document.getElementById('modal-result');
+  res.style.display = 'none';
+  document.getElementById('modal-confirm').disabled = false;
+  document.getElementById('modal-bg').classList.add('visible');
+}
+
+function closeModal() {
+  document.getElementById('modal-bg').classList.remove('visible');
+  modalCampaign = null;
+}
+
+async function submitCommission() {
+  if (!modalCampaign) return;
+  const scale = parseFloat(document.getElementById('modal-scale').value);
+  if (!scale || scale <= 0 || scale > 100) {
+    alert('Введи размер техкоста — число от 0 до 100');
+    return;
+  }
+  const confirmMsg = crmStatus.dry_run
+    ? `DRY-RUN: залогировать комиссию ${scale}% на «${modalCampaign.campaign_name}»?`
+    : `БОЕВОЙ режим. Реально создать комиссию ${scale}% на «${modalCampaign.campaign_name}»?`;
+  if (!confirm(confirmMsg)) return;
+
+  const btn = document.getElementById('modal-confirm');
+  btn.disabled = true;
+  const res = document.getElementById('modal-result');
+  res.style.display = 'block';
+  res.className = 'result';
+  res.textContent = 'Отправляю…';
+
+  try {
+    const r = await fetch('/crm/commission', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        campaign_id: modalCampaign.campaign_id,
+        advertiser_id: modalCampaign.advertiser_id,
+        agency_id: modalCampaign.agency_id,
+        tenant: modalCampaign.tenant,
+        commission_scale: scale,
+        campaign_name: modalCampaign.campaign_name,
+      }),
+    });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      res.className = 'result ok';
+      res.textContent = '✅ ' + data.message;
+    } else {
+      res.className = 'result err';
+      res.textContent = '❌ ' + (data.message || data.detail || 'ошибка');
+    }
+  } catch (e) {
+    res.className = 'result err';
+    res.textContent = '❌ ' + e;
+  }
+  btn.disabled = false;
+}
+// CRM:end
 
 function renderSummary(byS, total) {
   const pills = [['', 'total', '🌐', total]];
@@ -256,7 +390,7 @@ async function checkAuthHealth() {
 }
 
 async function loadCache() {
-  document.getElementById('rows').innerHTML = '<tr><td colspan="10" class="loading">загружаем кэш…</td></tr>';
+  document.getElementById('rows').innerHTML = '<tr><td colspan="11" class="loading">загружаем кэш…</td></tr>';
   const [sum, items] = await Promise.all([
     fetch('/cache/summary').then(r => r.json()),
     fetch('/cache/all').then(r => r.json()),
@@ -352,6 +486,10 @@ document.querySelectorAll('thead th[data-key]').forEach(th => {
 
 // при загрузке: подцепить кэш и проверить — вдруг уже идёт синк
 (async () => {
+  await loadCrmStatus();  // CRM:start/end
+  if (crmStatus.enabled) {
+    document.getElementById('th-crm').textContent = crmStatus.dry_run ? 'CRM (dry-run)' : 'CRM';
+  }
   await loadCache();
   const st = await fetch('/sync/status').then(r => r.json()).catch(() => null);
   if (st && st.status === 'running') startPolling();
