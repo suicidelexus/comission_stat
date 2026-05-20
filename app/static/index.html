@@ -159,8 +159,12 @@
     <h3>Создать комиссию (техкост)</h3>
     <div class="info" id="modal-info"></div>
     <div class="field">
-      <label>Размер техкоста, %</label>
-      <input type="number" id="modal-scale" step="0.1" min="0.1" max="100" placeholder="например 2" />
+      <label>Размер техкоста, % (целое число)</label>
+      <input type="number" id="modal-scale" step="1" min="1" max="100" placeholder="например 2" oninput="renderPayloadPreview()" />
+    </div>
+    <div class="field">
+      <label>Что уйдёт в CRM (payload):</label>
+      <pre id="modal-payload" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;overflow:auto;max-height:200px;margin:0">—</pre>
     </div>
     <div class="actions">
       <button onclick="closeModal()">Отмена</button>
@@ -298,7 +302,29 @@ function openCommissionModal(campaignId) {
   const res = document.getElementById('modal-result');
   res.style.display = 'none';
   document.getElementById('modal-confirm').disabled = false;
+  renderPayloadPreview();
   document.getElementById('modal-bg').classList.add('visible');
+}
+
+function renderPayloadPreview() {
+  if (!modalCampaign) return;
+  const scale = Math.round(parseFloat(document.getElementById('modal-scale').value) || 0);
+  const tdId = (crmStatus.trading_desks || {})[modalCampaign.tenant] || '⚠ нет TradingDeskId';
+  const payload = {
+    CommissionEntity: {
+      AgencyId: modalCampaign.agency_id,
+      AdvertiserId: modalCampaign.advertiser_id,
+      FolderId: null,
+      CampaignId: modalCampaign.campaign_id,
+      TradingDeskId: tdId,
+    },
+    Commission: {
+      Id: null, CommissionScale: scale,
+      DeviceType: null, OS: null, TrafficType: null,
+      BannerType: null, Rewarded: null, SspNumber: null,
+    },
+  };
+  document.getElementById('modal-payload').textContent = JSON.stringify(payload, null, 2);
 }
 
 function closeModal() {
@@ -390,6 +416,10 @@ async function checkAuthHealth() {
 }
 
 async function loadCache() {
+  await loadCrmStatus();  // CRM:start/end — обновляем статус и по кнопке "обновить"
+  if (crmStatus.enabled) {
+    document.getElementById('th-crm').textContent = crmStatus.dry_run ? 'CRM (dry-run)' : 'CRM';
+  }
   document.getElementById('rows').innerHTML = '<tr><td colspan="11" class="loading">загружаем кэш…</td></tr>';
   const [sum, items] = await Promise.all([
     fetch('/cache/summary').then(r => r.json()),

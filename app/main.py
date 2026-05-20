@@ -495,7 +495,11 @@ _static_dir = Path(__file__).resolve().parent / "static"
 
 @app.get("/")
 async def root() -> FileResponse:
-    return FileResponse(_static_dir / "index.html")
+    # no-cache — чтобы браузер не показывал старую версию страницы после деплоя
+    return FileResponse(
+        _static_dir / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")

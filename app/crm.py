@@ -104,7 +104,9 @@ async def _post_commission(payload: dict) -> tuple[int, str]:
 
 
 def _build_payload(req: CommissionRequest, trading_desk_id: str) -> dict:
-    """Собирает тело запроса в формате CRM AgencyCommission/Create."""
+    """Собирает тело запроса в формате CRM AgencyCommission/Create.
+    ВАЖНО: CommissionScale CRM принимает только как ЦЕЛОЕ число (integer) —
+    дробные проценты ломают десериализацию всего тела (400)."""
     return {
         "CommissionEntity": {
             "AgencyId": req.agency_id,
@@ -115,7 +117,7 @@ def _build_payload(req: CommissionRequest, trading_desk_id: str) -> dict:
         },
         "Commission": {
             "Id": None,
-            "CommissionScale": req.commission_scale,
+            "CommissionScale": int(round(req.commission_scale)),
             "DeviceType": None,
             "OS": None,
             "TrafficType": None,
@@ -192,8 +194,8 @@ async def create_commission(req: CommissionRequest) -> CommissionResult:
         raise HTTPException(status_code=502, detail=f"CRM запрос упал: {e}")
 
     ok = 200 <= status < 300
-    _append_log({**base_entry, "mode": "live", "crm_status": status,
-                 "crm_response": body, "ok": ok})
+    _append_log({**base_entry, "mode": "live", "payload": payload,
+                 "crm_status": status, "crm_response": body, "ok": ok})
     log.info("[CRM live] commission %.2f%% on %s → HTTP %d",
              req.commission_scale, req.campaign_name or req.campaign_id, status)
 
