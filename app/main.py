@@ -243,6 +243,7 @@ async def _fetch_all_campaigns_locked() -> list[CampaignPaceOut]:
                 compute_pace(
                     agency=f"[{tenant.label}] {agency.name or agency.id}",
                     agency_id=agency.id,
+                    agency_inventory_id=agency.inventoryId or "",
                     tenant=tenant.label,
                     advertiser_id=adv.id,
                     advertiser_name=adv.name or "",

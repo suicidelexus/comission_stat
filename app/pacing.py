@@ -47,6 +47,7 @@ def compute_pace(
     period_start: date,
     period_end: date,
     agency_id: str = "",
+    agency_inventory_id: str = "",
     tenant: str = "",
 ) -> CampaignPaceOut:
     """period_start..period_end — окно которое мы запросили у Hybrid'а.
@@ -120,6 +121,7 @@ def compute_pace(
     return CampaignPaceOut(
         agency=agency,
         agency_id=agency_id,
+        agency_inventory_id=agency_inventory_id,
         tenant=tenant,
         advertiser_id=advertiser_id,
         advertiser_name=advertiser_name,

@@ -3,6 +3,7 @@
 tmp_*.json
 cache.json
 commissions_log.json
+commissions_registry.json
 *.pyc
 __pycache__/
 .venv/

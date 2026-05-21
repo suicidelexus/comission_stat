@@ -76,6 +76,17 @@
     padding: 3px 9px; border-radius: 5px; font-size: 12px; cursor: pointer; white-space: nowrap; }
   .crm-btn:hover { background: rgba(96,165,250,0.3); }
   .crm-dry { font-size: 10px; color: var(--yellow); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 16px; cursor: pointer; color: var(--muted); border: 1px solid transparent;
+    border-bottom: none; border-radius: 6px 6px 0 0; font-size: 13px; user-select: none; }
+  .tab.active { color: var(--fg); background: var(--panel); border-color: var(--border); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  #modal .lvl { display: flex; gap: 6px; }
+  #modal .lvl label { flex: 1; display: flex; align-items: center; gap: 5px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+    cursor: pointer; font-size: 12px; margin: 0; }
+  #modal .lvl input { width: auto; }
   #modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
     align-items: center; justify-content: center; z-index: 100; }
   #modal-bg.visible { display: flex; }
@@ -124,6 +135,15 @@
   <div class="track"><div class="fill" id="sync-fill"></div></div>
 </div>
 
+<!-- CRM:start вкладки -->
+<div class="tabs" id="tabs">
+  <div class="tab active" data-tab="pace" onclick="switchTab('pace')">Pace</div>
+  <div class="tab" data-tab="commissions" onclick="switchTab('commissions')">Комиссии</div>
+</div>
+<!-- CRM:end -->
+
+<div id="tab-pace" class="tab-pane active">
+
 <div class="summary" id="summary"></div>
 
 <div class="filters">
@@ -153,16 +173,49 @@
 <tbody id="rows"><tr><td colspan="11" class="loading">загрузка…</td></tr></tbody>
 </table>
 
-<!-- CRM:start модалка создания комиссии -->
+</div><!-- /tab-pace -->
+
+<!-- CRM:start вкладка «Комиссии» -->
+<div id="tab-commissions" class="tab-pane">
+  <div class="filters">
+    <button onclick="loadCommissions()">↻ обновить</button>
+    <span class="muted">Показаны только комиссии, созданные через этот сервис</span>
+    <span class="count" id="comm-count">—</span>
+  </div>
+  <table>
+  <thead>
+  <tr>
+    <th>Уровень</th>
+    <th>На что назначена</th>
+    <th>Кабинет</th>
+    <th class="num">Техкост %</th>
+    <th>Создана</th>
+    <th>Действия</th>
+  </tr>
+  </thead>
+  <tbody id="comm-rows"><tr><td colspan="6" class="loading">—</td></tr></tbody>
+  </table>
+</div><!-- /tab-commissions -->
+<!-- CRM:end -->
+
+<!-- CRM:start модалка создания/изменения комиссии -->
 <div id="modal-bg">
   <div id="modal">
-    <h3>Создать комиссию (техкост)</h3>
+    <h3 id="modal-title">Создать комиссию (техкост)</h3>
     <div class="info" id="modal-info"></div>
+    <div class="field" id="modal-level-field">
+      <label>Уровень — на что назначить комиссию</label>
+      <div class="lvl">
+        <label><input type="radio" name="lvl" value="campaign" checked onchange="renderPayloadPreview()"> Кампания</label>
+        <label><input type="radio" name="lvl" value="advertiser" onchange="renderPayloadPreview()"> Рекламодатель</label>
+        <label><input type="radio" name="lvl" value="agency" onchange="renderPayloadPreview()"> Агентство</label>
+      </div>
+    </div>
     <div class="field">
       <label>Размер техкоста, % (целое число)</label>
       <input type="number" id="modal-scale" step="1" min="1" max="100" placeholder="например 2" oninput="renderPayloadPreview()" />
     </div>
-    <div class="field">
+    <div class="field" id="modal-payload-field">
       <label>Что уйдёт в CRM (payload):</label>
       <pre id="modal-payload" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;overflow:auto;max-height:200px;margin:0">—</pre>
     </div>
@@ -269,9 +322,12 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-// CRM:start — кнопка комиссии в строке + модалка
+// CRM:start — вкладки, кнопка комиссии, модалка create/edit, вкладка «Комиссии»
 let crmStatus = { enabled: false, dry_run: true };
-let modalCampaign = null;
+let modalCampaign = null;     // строка Pace при создании
+let modalMode = 'create';     // create | edit
+let modalEditRow = null;      // запись реестра при редактировании
+const LEVEL_RU = { campaign: 'Кампания', advertiser: 'Рекламодатель', agency: 'Агентство' };
 
 async function loadCrmStatus() {
   try {
@@ -279,95 +335,152 @@ async function loadCrmStatus() {
   } catch (_) { crmStatus = { enabled: false, dry_run: true }; }
 }
 
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+  if (name === 'commissions') loadCommissions();
+}
+
 function crmCell(x) {
   if (!crmStatus.enabled) return '';
   if (x.signal !== 'green') return '';
-  if (!x.agency_id || !x.campaign_id) return '';
+  if (!x.agency_id) return '';
   return `<button class="crm-btn" onclick="openCommissionModal('${x.campaign_id}')">💰 техкост</button>`;
+}
+
+function selectedLevel() {
+  const el = document.querySelector('input[name="lvl"]:checked');
+  return el ? el.value : 'campaign';
 }
 
 function openCommissionModal(campaignId) {
   const x = allData.find(c => c.campaign_id === campaignId);
   if (!x) return;
+  modalMode = 'create';
   modalCampaign = x;
+  modalEditRow = null;
+  document.getElementById('modal-title').textContent = 'Создать комиссию (техкост)';
+  document.getElementById('modal-level-field').style.display = '';
+  document.getElementById('modal-payload-field').style.display = '';
+  document.querySelector('input[name="lvl"][value="campaign"]').checked = true;
   const dryNote = crmStatus.dry_run
     ? '<br><span class="crm-dry">⚠ DRY-RUN: запрос НЕ отправится в CRM, только залогируется.</span>'
     : '<br><b style="color:var(--red)">БОЕВОЙ режим — комиссия создастся реально!</b>';
   document.getElementById('modal-info').innerHTML =
     `<b>${escapeHtml(x.campaign_name)}</b><br>` +
-    `${escapeHtml(x.agency)} → ${escapeHtml(x.advertiser_name || x.advertiser_id)}<br>` +
-    `вчера: ${x.pace_yesterday !== null ? Math.round(x.pace_yesterday*100)+'%' : '—'} от дневного` +
+    `${escapeHtml(x.agency)} → ${escapeHtml(x.advertiser_name || x.advertiser_id)}` +
     dryNote;
   document.getElementById('modal-scale').value = '';
   const res = document.getElementById('modal-result');
   res.style.display = 'none';
+  document.getElementById('modal-confirm').textContent = 'Создать';
   document.getElementById('modal-confirm').disabled = false;
   renderPayloadPreview();
   document.getElementById('modal-bg').classList.add('visible');
 }
 
+function openEditModal(commissionId) {
+  const row = crmCommissions.find(c => c.commission_id === commissionId);
+  if (!row) return;
+  modalMode = 'edit';
+  modalEditRow = row;
+  modalCampaign = null;
+  document.getElementById('modal-title').textContent = 'Изменить комиссию';
+  document.getElementById('modal-level-field').style.display = 'none';
+  document.getElementById('modal-payload-field').style.display = 'none';
+  const dryNote = crmStatus.dry_run
+    ? '<br><span class="crm-dry">⚠ DRY-RUN: изменение НЕ отправится в CRM.</span>'
+    : '<br><b style="color:var(--red)">БОЕВОЙ режим — изменение применится реально!</b>';
+  document.getElementById('modal-info').innerHTML =
+    `<b>${escapeHtml(row.target_name || row.target_id)}</b><br>` +
+    `уровень: ${LEVEL_RU[row.level] || row.level} • кабинет: ${escapeHtml(row.tenant)}<br>` +
+    `текущий техкост: ${row.scale}%` + dryNote;
+  document.getElementById('modal-scale').value = row.scale;
+  const res = document.getElementById('modal-result');
+  res.style.display = 'none';
+  document.getElementById('modal-confirm').textContent = 'Сохранить';
+  document.getElementById('modal-confirm').disabled = false;
+  document.getElementById('modal-bg').classList.add('visible');
+}
+
 function renderPayloadPreview() {
-  if (!modalCampaign) return;
+  if (modalMode !== 'create' || !modalCampaign) return;
+  const x = modalCampaign;
   const scale = Math.round(parseFloat(document.getElementById('modal-scale').value) || 0);
-  const tdId = (crmStatus.trading_desks || {})[modalCampaign.tenant] || '⚠ нет TradingDeskId';
+  const tdId = (crmStatus.trading_desks || {})[x.tenant] || '⚠ нет TradingDeskId';
+  const lvl = selectedLevel();
+  let entity;
+  if (lvl === 'agency') {
+    entity = { AgencyId: x.agency_id, AdvertiserId: null, TradingDeskId: tdId };
+  } else if (lvl === 'advertiser') {
+    entity = { AgencyId: x.agency_id, AdvertiserId: x.advertiser_id, TradingDeskId: tdId };
+  } else {
+    entity = { AgencyId: x.agency_id, AdvertiserId: x.advertiser_id,
+               FolderId: null, CampaignId: x.campaign_id, TradingDeskId: tdId };
+  }
   const payload = {
-    CommissionEntity: {
-      AgencyId: modalCampaign.agency_id,
-      AdvertiserId: modalCampaign.advertiser_id,
-      FolderId: null,
-      CampaignId: modalCampaign.campaign_id,
-      TradingDeskId: tdId,
-    },
-    Commission: {
-      Id: null, CommissionScale: scale,
-      DeviceType: null, OS: null, TrafficType: null,
-      BannerType: null, Rewarded: null, SspNumber: null,
-    },
+    CommissionEntity: entity,
+    Commission: { Id: null, CommissionScale: scale, DeviceType: null, OS: null,
+                  TrafficType: null, BannerType: null, Rewarded: null, SspNumber: null },
   };
   document.getElementById('modal-payload').textContent = JSON.stringify(payload, null, 2);
 }
 
 function closeModal() {
   document.getElementById('modal-bg').classList.remove('visible');
-  modalCampaign = null;
+  modalCampaign = null; modalEditRow = null;
 }
 
 async function submitCommission() {
-  if (!modalCampaign) return;
-  const scale = parseFloat(document.getElementById('modal-scale').value);
+  const scale = Math.round(parseFloat(document.getElementById('modal-scale').value));
   if (!scale || scale <= 0 || scale > 100) {
-    alert('Введи размер техкоста — число от 0 до 100');
+    alert('Введи размер техкоста — целое число от 1 до 100');
     return;
   }
-  const confirmMsg = crmStatus.dry_run
-    ? `DRY-RUN: залогировать комиссию ${scale}% на «${modalCampaign.campaign_name}»?`
-    : `БОЕВОЙ режим. Реально создать комиссию ${scale}% на «${modalCampaign.campaign_name}»?`;
+  const btn = document.getElementById('modal-confirm');
+  const res = document.getElementById('modal-result');
+
+  let url, body, confirmMsg;
+  if (modalMode === 'edit') {
+    url = '/crm/commission/update';
+    body = { commission_id: modalEditRow.commission_id, commission_scale: scale };
+    confirmMsg = crmStatus.dry_run
+      ? `DRY-RUN: изменить на ${scale}%?`
+      : `БОЕВОЙ: реально изменить комиссию на «${modalEditRow.target_name}» → ${scale}%?`;
+  } else {
+    const lvl = selectedLevel();
+    const x = modalCampaign;
+    const targetName = lvl === 'agency' ? x.agency
+      : lvl === 'advertiser' ? (x.advertiser_name || x.advertiser_id)
+      : x.campaign_name;
+    url = '/crm/commission';
+    body = {
+      level: lvl, tenant: x.tenant, agency_id: x.agency_id,
+      agency_inventory_id: x.agency_inventory_id || '',
+      advertiser_id: x.advertiser_id, campaign_id: x.campaign_id,
+      commission_scale: scale, target_name: targetName,
+    };
+    confirmMsg = crmStatus.dry_run
+      ? `DRY-RUN: залогировать комиссию ${scale}% (${LEVEL_RU[lvl]})?`
+      : `БОЕВОЙ режим. Создать комиссию ${scale}% на ${LEVEL_RU[lvl].toLowerCase()} «${targetName}»?`;
+  }
   if (!confirm(confirmMsg)) return;
 
-  const btn = document.getElementById('modal-confirm');
   btn.disabled = true;
-  const res = document.getElementById('modal-result');
   res.style.display = 'block';
   res.className = 'result';
   res.textContent = 'Отправляю…';
-
   try {
-    const r = await fetch('/crm/commission', {
+    const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        campaign_id: modalCampaign.campaign_id,
-        advertiser_id: modalCampaign.advertiser_id,
-        agency_id: modalCampaign.agency_id,
-        tenant: modalCampaign.tenant,
-        commission_scale: scale,
-        campaign_name: modalCampaign.campaign_name,
-      }),
+      body: JSON.stringify(body),
     });
     const data = await r.json();
     if (r.ok && data.ok) {
       res.className = 'result ok';
       res.textContent = '✅ ' + data.message;
+      if (modalMode === 'edit') loadCommissions();
     } else {
       res.className = 'result err';
       res.textContent = '❌ ' + (data.message || data.detail || 'ошибка');
@@ -377,6 +490,57 @@ async function submitCommission() {
     res.textContent = '❌ ' + e;
   }
   btn.disabled = false;
+}
+
+// --- вкладка «Комиссии» ---
+let crmCommissions = [];
+
+async function loadCommissions() {
+  const tb = document.getElementById('comm-rows');
+  tb.innerHTML = '<tr><td colspan="6" class="loading">загрузка…</td></tr>';
+  try {
+    crmCommissions = await fetch('/crm/commissions').then(r => r.json());
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="6" class="loading">ошибка: ${e}</td></tr>`;
+    return;
+  }
+  document.getElementById('comm-count').textContent = `${crmCommissions.length} комиссий`;
+  if (!crmCommissions.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="loading">пусто — комиссии ещё не создавались через сервис</td></tr>';
+    return;
+  }
+  tb.innerHTML = crmCommissions.map(c => {
+    const idKnown = c.id_resolved !== false && !String(c.commission_id).startsWith('unknown-');
+    const actions = idKnown
+      ? `<button class="crm-btn" onclick="openEditModal('${c.commission_id}')">✏ изменить</button>
+         <button class="crm-btn" style="border-color:var(--red);color:var(--red)" onclick="deleteCommission('${c.commission_id}')">🗑 удалить</button>`
+      : `<span class="muted">id не определён</span>`;
+    return `<tr>
+      <td>${LEVEL_RU[c.level] || c.level}</td>
+      <td class="ellipsis" title="${escapeHtml(c.target_name || c.target_id)}">${escapeHtml(c.target_name || c.target_id)}</td>
+      <td>${escapeHtml(c.tenant)}</td>
+      <td class="num"><span class="pace-badge green">${c.scale}%</span></td>
+      <td class="muted">${(c.created_at || '').slice(0,16).replace('T',' ')}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function deleteCommission(commissionId) {
+  const row = crmCommissions.find(c => c.commission_id === commissionId);
+  const name = row ? (row.target_name || row.target_id) : commissionId;
+  const msg = crmStatus.dry_run
+    ? `DRY-RUN: залогировать удаление комиссии на «${name}»?`
+    : `БОЕВОЙ режим. Реально удалить комиссию на «${name}» из CRM?`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await fetch('/crm/commission/' + encodeURIComponent(commissionId), { method: 'DELETE' });
+    const data = await r.json();
+    alert((data.ok ? '✅ ' : '❌ ') + (data.message || data.detail || ''));
+    loadCommissions();
+  } catch (e) {
+    alert('❌ ' + e);
+  }
 }
 // CRM:end
 

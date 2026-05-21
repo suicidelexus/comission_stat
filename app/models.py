@@ -121,7 +121,8 @@ class SignalLevel(str, Enum):
 class CampaignPaceOut(BaseModel):
     """То что отдаём наружу — для UI/JSON ответа."""
     agency: str
-    agency_id: str = ""        # 24-hex id агентства (нужен для CRM-комиссий)
+    agency_id: str = ""        # 24-hex id агентства (для CRM Create)
+    agency_inventory_id: str = ""  # inventoryId агентства (для CRM фильтров GetCampaignCommission)
     tenant: str = ""           # label кабинета (Hybrid / Selfclick)
     advertiser_id: str
     advertiser_name: str = ""
