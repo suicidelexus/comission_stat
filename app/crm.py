@@ -380,13 +380,32 @@ async def update_commission(req: UpdateRequest) -> CommissionResult:
     ok = 200 <= status < 300
     _append_log({**base, "mode": "live", "payload": payload,
                  "crm_status": status, "crm_response": text[:500], "ok": ok})
-    if ok:
-        row["scale"] = scale
-        row["updated_at"] = datetime.utcnow().isoformat()
-        _save_registry(rows)
-    return CommissionResult(ok=ok, dry_run=False, commission_id=req.commission_id,
-                            crm_status=status,
-                            message="Комиссия изменена" if ok else f"CRM вернул HTTP {status}")
+    if not ok:
+        return CommissionResult(ok=False, dry_run=False, commission_id=req.commission_id,
+                                crm_status=status, message=f"CRM вернул HTTP {status}")
+
+    # ВАЖНО: Update в CRM = replace — старая комиссия помечается removed,
+    # создаётся НОВАЯ с новым id/overallId. Поэтому после Update заново
+    # резолвим id, иначе реестр будет хранить мёртвый id и Delete промахнётся.
+    new = await _resolve_commission(ent_req)
+    new_id = new.get("id") if new else None
+    row["scale"] = scale
+    row["updated_at"] = datetime.utcnow().isoformat()
+    if new_id:
+        row["commission_id"] = new_id
+        row["overall_id"] = new.get("overall_id")
+        row["id_resolved"] = True
+    else:
+        # не нашли новый id — помечаем чтобы кнопки изменить/удалить пропали
+        row["id_resolved"] = False
+    _save_registry(rows)
+    msg = "Комиссия изменена"
+    if new_id:
+        msg += f" (новый id={new.get('overall_id')})"
+    else:
+        msg += " — но новый id не определён, обнови вкладку «Комиссии»"
+    return CommissionResult(ok=True, dry_run=False, commission_id=new_id,
+                            crm_status=status, message=msg)
 
 
 @router.delete("/commission/{commission_id}", response_model=CommissionResult)
