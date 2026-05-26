@@ -133,8 +133,8 @@ class CampaignPaceOut(BaseModel):
     campaign_name: str
     status: int
 
-    start_date: datetime
-    end_date: Optional[datetime]
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
     is_dont_expire: bool
     days_total: Optional[int]
     days_passed: int
